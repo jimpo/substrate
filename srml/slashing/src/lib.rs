@@ -80,7 +80,7 @@
 //!
 //! struct Balance<T>(PhantomData<T>);
 //!
-//! impl<T: Trait> OnSlashing<T> for Balance<T> {
+//! impl<T: Trait> OnSlashing<T::AccountId> for Balance<T> {
 //!
 //!		fn on_slash(who: &T::AccountId, misconduct: &impl Misconduct) {
 //!			// This doesn't compile, see `srml/staking/slash.rs` for a more elaborate example
@@ -93,7 +93,7 @@
 //!
 //!	struct SlashingWrapper<T>(PhantomData<T>);
 //!
-//!	impl<T: Trait> Slashing<T> for SlashingWrapper<T> {
+//!	impl<T: Trait> Slashing<T::AccountId> for SlashingWrapper<T> {
 //!		type Slash = Balance<T>;
 //!
 //!		fn slash(who: &T::AccountId, misconduct: &mut impl Misconduct) {
@@ -141,6 +141,27 @@ pub trait OnSlashing<AccountId> {
 }
 
 /// Slashing wrapper interface on top of `OnSlashing`
+// TODO(niklasad1): provide generic implementation with `OnSlashing` as trait parameter?!
+// Something like
+//
+// pub trait Slashing<AccountId, OS: OnSlashing<AccountId>> {
+//     fn slash(who: &AccountId, misconduct: &mut impl Misconduct);
+//     fn on_signal(misconduct: &mut impl Misconduct);
+// }
+//
+// impl<AccountId, OS: OnSlashing<AccountId>, T> Slashing<AccountId, OS> for T
+// where
+//     OS: OnSlashing<AccountId>
+// {
+//     fn slash(who: &AccountId, misconduct: &mut impl Misconduct) {
+//         OS::on_slash(who, misconduct);
+//         misconduct.on_misconduct();
+//     }
+//
+//     fn on_signal(misconduct: &mut impl Misconduct) {
+//         misconduct.on_signal();
+//     }
+// }
 pub trait Slashing<AccountId> {
 	/// Specify which `OnSlashing` implementation to use
 	type Slash: OnSlashing<AccountId>;
