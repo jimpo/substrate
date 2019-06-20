@@ -123,7 +123,7 @@ fn try_evict_or_and_pay_rent<T: Trait>(
 			)
 			.expect(
 				"Withdraw has been checked above;
-				go_below_subsistence is false and subsistence > existencial_deposit;
+				go_below_subsistence is false and subsistence > existential_deposit;
 				qed",
 			);
 
@@ -142,7 +142,10 @@ fn try_evict_or_and_pay_rent<T: Trait>(
 	} else {
 		// Evict
 
+        // Should we really be deducting beyond the balance locks?
+		// This seems to deduct beyond the rent allowance
 		if can_withdraw_rent && !go_below_subsistence {
+			// Rent allowance is not decremented
 			T::Currency::withdraw(
 				account,
 				dues,
@@ -151,6 +154,8 @@ fn try_evict_or_and_pay_rent<T: Trait>(
 			)
 			.expect("Can withdraw and don't go below subsistence");
 		} else if !is_below_subsistence {
+			// CHECK: What if !go_below_subsistence threshold either? Shouldn't this withdraw down
+			// by dues_limited? Also, it should stay above Currency::min_deposit, right?
 			T::Currency::make_free_balance_be(account, subsistence_threshold);
 		} else {
 			T::Currency::make_free_balance_be(account, <BalanceOf<T>>::zero());

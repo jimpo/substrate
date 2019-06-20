@@ -94,7 +94,7 @@ use crate::account_db::{AccountDb, DirectAccountDb};
 #[cfg(feature = "std")]
 use serde::{Serialize, Deserialize};
 use substrate_primitives::crypto::UncheckedFrom;
-use rstd::{prelude::*, marker::PhantomData, convert::TryFrom};
+use rstd::{self, prelude::*, marker::PhantomData, convert::TryFrom};
 use parity_codec::{Codec, Encode, Decode};
 use runtime_io::blake2_256;
 use runtime_primitives::traits::{
@@ -528,6 +528,7 @@ decl_module! {
 
 			// If poking the contract has lead to eviction of the contract, give out the rewards.
 			if rent::try_evict::<T>(&dest, handicap) == rent::RentOutcome::Evicted {
+				// NOTE: Why is surcharge reward not proportional to the storage size?
 				T::Currency::deposit_into_existing(rewarded, Self::surcharge_reward())?;
 			}
 		}

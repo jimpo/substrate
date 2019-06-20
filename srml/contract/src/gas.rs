@@ -127,6 +127,7 @@ impl<T: Trait> GasMeter<T> {
 		let amount = token.calculate_amount(metadata);
 		let new_value = match self.gas_left.checked_sub(&amount) {
 			None => None,
+            // CHECK: Why can't we proceed here if the gas is exactly right?
 			Some(val) if val.is_zero() => None,
 			Some(val) => Some(val),
 		};
@@ -223,14 +224,7 @@ pub fn buy_gas<T: Trait>(
 		ExistenceRequirement::KeepAlive
 	)?;
 
-	Ok((GasMeter {
-		limit: gas_limit,
-		gas_left: gas_limit,
-		gas_price,
-
-		#[cfg(test)]
-		tokens: Vec::new(),
-	}, imbalance))
+	Ok((GasMeter::with_limit(gas_limit, gas_price), imbalance))
 }
 
 /// Refund the unused gas.
