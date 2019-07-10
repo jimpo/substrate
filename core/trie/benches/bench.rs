@@ -14,8 +14,17 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
+mod disk_bench;
+
+use disk_bench::{benchmark_read_by_value_size, benchmark_write_by_value_size};
+
+use std::time::Duration;
 use criterion::{Criterion, criterion_group, criterion_main};
-criterion_group!(benches, benchmark);
+criterion_group!(
+	name = benches;
+	config = Criterion::default();
+	targets = benchmark_read_by_value_size
+);
 criterion_main!(benches);
 
 fn benchmark(c: &mut Criterion) {

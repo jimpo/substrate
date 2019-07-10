@@ -25,7 +25,12 @@ trie-bench = { version = "0.14.0" }
 trie-standardmap = { version = "0.14.0" }
 keccak-hasher = { version = "0.14.0" }
 criterion = "0.2"
+itertools = "0.8"
 hex-literal = "0.2.0"
+kvdb = { git = "https://github.com/paritytech/parity-common", rev="b0317f649ab2c665b7987b8475878fc4d2e1f81d" }
+kvdb-rocksdb = { git = "https://github.com/paritytech/parity-common", rev="b0317f649ab2c665b7987b8475878fc4d2e1f81d" }
+rand = "0.7"
+tempdir = "0.3.7"
 
 [features]
 default = ["std"]
