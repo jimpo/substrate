@@ -66,17 +66,6 @@ macro_rules! try_or_exec_error {
        }
 }
 
-#[cfg_attr(test, derive(Debug))]
-pub struct InstantiateReceipt<AccountId> {
-	pub address: AccountId,
-}
-
-#[cfg_attr(test, derive(Debug))]
-pub struct CallReceipt {
-	/// Output data received as a result of a call.
-	pub output_data: Vec<u8>,
-}
-
 pub type StorageKey = [u8; 32];
 
 /// An interface that provides access to the external environment in which the
@@ -107,7 +96,7 @@ pub trait Ext {
 		value: BalanceOf<Self::T>,
 		gas_meter: &mut GasMeter<Self::T>,
 		input_data: Vec<u8>,
-	) -> Result<InstantiateReceipt<AccountIdOf<Self::T>>, ExecError>;
+	) -> Result<(AccountIdOf<Self::T>, ExecReturnValue), ExecError>;
 
 	/// Call (possibly transferring some amount of funds) into the specified account.
 	fn call(
@@ -116,7 +105,7 @@ pub trait Ext {
 		value: BalanceOf<Self::T>,
 		gas_meter: &mut GasMeter<Self::T>,
 		input_data: Vec<u8>,
-	) -> Result<CallReceipt, ExecError>;
+	) -> ExecResult;
 
 	/// Notes a call dispatch.
 	fn note_dispatch_call(&mut self, call: CallOf<Self::T>);
@@ -324,7 +313,7 @@ where
 		value: BalanceOf<T>,
 		gas_meter: &mut GasMeter<T>,
 		input_data: Vec<u8>,
-	) -> Result<CallReceipt, ExecError> {
+	) -> ExecResult {
 		if self.depth == self.config.max_depth as usize {
 			return Err(ExecError {
 				reason: "reached maximum depth, cannot make a call",
@@ -358,7 +347,7 @@ where
 		let caller = self.self_account.clone();
 		let dest_trie_id = contract_info.and_then(|i| i.as_alive().map(|i| i.trie_id.clone()));
 
-		let output = self.with_nested_context(dest.clone(), dest_trie_id, |nested| {
+		self.with_nested_context(dest.clone(), dest_trie_id, |nested| {
 			if value > BalanceOf::<T>::zero() {
 				try_or_exec_error!(
 					transfer(
@@ -391,9 +380,7 @@ where
 				}
 				None => Ok(ExecReturnValue { data: Vec::new() }),
 			}
-		})?;
-
-		Ok(CallReceipt { output_data: output.data })
+		})
 	}
 
 	pub fn instantiate(
@@ -402,7 +389,7 @@ where
 		gas_meter: &mut GasMeter<T>,
 		code_hash: &CodeHash<T>,
 		input_data: Vec<u8>,
-	) -> Result<InstantiateReceipt<T::AccountId>, ExecError> {
+	) -> Result<(T::AccountId, ExecReturnValue), ExecError> {
 		if self.depth == self.config.max_depth as usize {
 			return Err(ExecError {
 				reason: "reached maximum depth, cannot create",
@@ -430,7 +417,7 @@ where
 		// TrieId has not been generated yet and storage is empty since contract is new.
 		let dest_trie_id = None;
 
-		let _ = self.with_nested_context(dest.clone(), dest_trie_id, |nested| {
+		let output = self.with_nested_context(dest.clone(), dest_trie_id, |nested| {
 			try_or_exec_error!(
 				nested.overlay.create_contract(&dest, code_hash.clone()),
 				input_data
@@ -471,7 +458,7 @@ where
 			Ok(output)
 		})?;
 
-		Ok(InstantiateReceipt { address: dest })
+		Ok((dest, output))
 	}
 
 	fn new_call_context<'b>(&'b mut self, caller: T::AccountId, value: BalanceOf<T>)
@@ -667,7 +654,7 @@ where
 		endowment: BalanceOf<T>,
 		gas_meter: &mut GasMeter<T>,
 		input_data: Vec<u8>,
-	) -> Result<InstantiateReceipt<AccountIdOf<T>>, ExecError> {
+	) -> Result<(AccountIdOf<T>, ExecReturnValue), ExecError> {
 		self.ctx.instantiate(endowment, gas_meter, code_hash, input_data)
 	}
 
@@ -677,7 +664,7 @@ where
 		value: BalanceOf<T>,
 		gas_meter: &mut GasMeter<T>,
 		input_data: Vec<u8>,
-	) -> Result<CallReceipt, ExecError> {
+	) -> ExecResult {
 		self.ctx.call(to.clone(), value, gas_meter, input_data)
 	}
 
@@ -765,7 +752,7 @@ where
 mod tests {
 	use super::{
 		BalanceOf, ExecFeeToken, ExecutionContext, Ext, Loader, TransferFeeKind, TransferFeeToken,
-		Vm, ExecResult, InstantiateReceipt, RawEvent, DeferredAction,
+		Vm, ExecResult, RawEvent, DeferredAction,
 	};
 	use crate::account_db::AccountDb;
 	use crate::exec::{ExecReturnValue, ExecError};
@@ -1138,8 +1125,8 @@ mod tests {
 				vec![],
 			);
 
-			let output_data = result.unwrap().output_data;
-			assert_eq!(&output_data, &[1, 2, 3, 4]);
+			let output = result.unwrap();
+			assert_eq!(output.data, vec![1, 2, 3, 4]);
 		});
 	}
 
@@ -1362,7 +1349,7 @@ mod tests {
 						&dummy_ch,
 						vec![],
 					),
-					Ok(InstantiateReceipt { address }) => address
+					Ok((address, _)) => address
 				);
 
 				// Check that the newly created account has the expected code hash and
@@ -1394,17 +1381,15 @@ mod tests {
 			let created_contract_address = Rc::clone(&created_contract_address);
 			move |ctx| {
 				// Instantiate a contract and save it's address in `created_contract_address`.
-				*created_contract_address.borrow_mut() =
-					ctx.ext.instantiate(
-						&dummy_ch,
-						15u64,
-						ctx.gas_meter,
-						vec![]
-					)
-					.unwrap()
-					.address.into();
+				let (address, output) = ctx.ext.instantiate(
+					&dummy_ch,
+					15u64,
+					ctx.gas_meter,
+					vec![]
+				).unwrap();
 
-				exec_success()
+				*created_contract_address.borrow_mut() = address.into();
+				Ok(output)
 			}
 		});
 
