@@ -1445,6 +1445,7 @@ fn restoration(test_different_storage: bool, test_restore_to_with_dirty_storage:
 			} else {
 				// Here we expect that the restoration is succeeded. Check that the restoration
 				// contract `DJANGO` ceased to exist and that `BOB` returned back.
+				println!("{:?}", ContractInfoOf::<Test>::get(BOB));
 				let bob_contract = ContractInfoOf::<Test>::get(BOB).unwrap()
 					.get_alive().unwrap();
 				assert_eq!(bob_contract.rent_allowance, 50);
