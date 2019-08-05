@@ -46,9 +46,25 @@ pub struct ExecReturnValue {
 #[cfg_attr(test, derive(Debug))]
 pub struct ExecError {
 	pub reason: &'static str,
+	/// This is an allocated buffer that may be reused. The buffer must be cleared be explicitly
+	/// cleared before reuse.
+	pub buffer: Vec<u8>,
 }
 
 pub type ExecResult = Result<ExecReturnValue, ExecError>;
+
+/// Evaluate an expression of type Result<_, &'static str> and either resolve to the value if Ok or
+/// wrap the error string into an ExecutionError with the provided buffer and return from the
+/// enclosing function. This macro is used instead of .map_err(..)? in order to avoid taking
+/// ownership of buffer unless there is an error.
+macro_rules! try_or_exec_error {
+       ($e:expr, $buffer:expr) => {
+               match $e {
+                       Ok(val) => val,
+                       Err(reason) => return Err(ExecError { reason, buffer: $buffer }),
+               }
+       }
+}
 
 #[cfg_attr(test, derive(Debug))]
 pub struct InstantiateReceipt<AccountId> {
@@ -310,14 +326,20 @@ where
 		input_data: Vec<u8>,
 	) -> Result<CallReceipt, ExecError> {
 		if self.depth == self.config.max_depth as usize {
-			return Err(ExecError { reason: "reached maximum depth, cannot make a call" });
+			return Err(ExecError {
+				reason: "reached maximum depth, cannot make a call",
+				buffer: input_data,
+			});
 		}
 
 		if gas_meter
 			.charge(self.config, ExecFeeToken::Call)
 			.is_out_of_gas()
 		{
-			return Err(ExecError { reason: "not enough gas to pay base call fee" });
+			return Err(ExecError {
+				reason: "not enough gas to pay base call fee",
+				buffer: input_data,
+			});
 		}
 
 		// Assumption: pay_rent doesn't collide with overlay because
@@ -327,7 +349,10 @@ where
 
 		// Calls to dead contracts always fail.
 		if let Some(ContractInfo::Tombstone(_)) = contract_info {
-			return Err(ExecError { reason: "contract has been evicted" });
+			return Err(ExecError {
+				reason: "contract has been evicted",
+				buffer: input_data,
+			});
 		};
 
 		let caller = self.self_account.clone();
@@ -335,22 +360,27 @@ where
 
 		let output = self.with_nested_context(dest.clone(), dest_trie_id, |nested| {
 			if value > BalanceOf::<T>::zero() {
-				transfer(
-					gas_meter,
-					TransferCause::Call,
-					&caller,
-					&dest,
-					value,
-					nested,
-				).map_err(|reason| ExecError { reason })?;
+				try_or_exec_error!(
+					transfer(
+						gas_meter,
+						TransferCause::Call,
+						&caller,
+						&dest,
+						value,
+						nested,
+					),
+					input_data
+				);
 			}
 
 			// If code_hash is not none, then the destination account is a live contract, otherwise
 			// it is a regular account since tombstone accounts have already been rejected.
 			match nested.overlay.get_code_hash(&dest) {
 				Some(dest_code_hash) => {
-					let executable = nested.loader.load_main(&dest_code_hash)
-						.map_err(|reason| ExecError { reason })?;
+					let executable = try_or_exec_error!(
+						nested.loader.load_main(&dest_code_hash),
+						 input_data
+					);
 					nested.vm
 						.execute(
 							&executable,
@@ -374,14 +404,20 @@ where
 		input_data: Vec<u8>,
 	) -> Result<InstantiateReceipt<T::AccountId>, ExecError> {
 		if self.depth == self.config.max_depth as usize {
-			return Err(ExecError { reason: "reached maximum depth, cannot create" });
+			return Err(ExecError {
+				reason: "reached maximum depth, cannot create",
+				buffer: input_data,
+			});
 		}
 
 		if gas_meter
 			.charge(self.config, ExecFeeToken::Instantiate)
 			.is_out_of_gas()
 		{
-			return Err(ExecError { reason: "not enough gas to pay base instantiate fee" });
+			return Err(ExecError {
+				reason: "not enough gas to pay base instantiate fee",
+				buffer: input_data,
+			});
 		}
 
 		let caller = self.self_account.clone();
@@ -395,22 +431,29 @@ where
 		let dest_trie_id = None;
 
 		let _ = self.with_nested_context(dest.clone(), dest_trie_id, |nested| {
-			nested.overlay.create_contract(&dest, code_hash.clone())
-				.map_err(|reason| ExecError { reason })?;
+			try_or_exec_error!(
+				nested.overlay.create_contract(&dest, code_hash.clone()),
+				input_data
+			);
 
 			// Send funds unconditionally here. If the `endowment` is below existential_deposit
 			// then error will be returned here.
-			transfer(
-				gas_meter,
-				TransferCause::Instantiate,
-				&caller,
-				&dest,
-				endowment,
-				nested,
-			).map_err(|reason| ExecError { reason })?;
+			try_or_exec_error!(
+				transfer(
+					gas_meter,
+					TransferCause::Instantiate,
+					&caller,
+					&dest,
+					endowment,
+					nested,
+				),
+				input_data
+			);
 
-			let executable = nested.loader.load_init(&code_hash)
-				.map_err(|reason| ExecError { reason })?;
+			let executable = try_or_exec_error!(
+				nested.loader.load_init(&code_hash),
+				input_data
+			);
 			let output = nested.vm
 				.execute(
 					&executable,
@@ -1063,7 +1106,10 @@ mod tests {
 				vec![],
 			);
 
-			assert_matches!(result, Err(ExecError { reason: "balance too low to send value" }));
+			assert_matches!(
+				result,
+				Err(ExecError { reason: "balance too low to send value", buffer: _ })
+			);
 			assert_eq!(ctx.overlay.get_balance(&origin), 0);
 			assert_eq!(ctx.overlay.get_balance(&dest), 0);
 		});
@@ -1155,7 +1201,7 @@ mod tests {
 				// Verify that we've got proper error and set `reached_bottom`.
 				assert_matches!(
 					r,
-					Err(ExecError { reason: "reached maximum depth, cannot make a call" })
+					Err(ExecError { reason: "reached maximum depth, cannot make a call", buffer: _ })
 				);
 				*reached_bottom = true;
 			} else {
@@ -1403,7 +1449,9 @@ mod tests {
 		let vm = MockVm::new();
 
 		let mut loader = MockLoader::empty();
-		let dummy_ch = loader.insert(|_| Err(ExecError { reason: "It's a trap!" }));
+		let dummy_ch = loader.insert(
+			|_| Err(ExecError { reason: "It's a trap!", buffer: Vec::new() })
+		);
 		let creator_ch = loader.insert({
 			let dummy_ch = dummy_ch.clone();
 			move |ctx| {
@@ -1415,7 +1463,7 @@ mod tests {
 						ctx.gas_meter,
 						vec![]
 					),
-					Err(ExecError { reason: "It's a trap!" })
+					Err(ExecError { reason: "It's a trap!", buffer: _ })
 				);
 
 				exec_success()
