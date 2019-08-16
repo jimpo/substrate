@@ -267,5 +267,9 @@ macro_rules! impl_function_executor {
 				};
 			}
 		}
+
+		lucet_hostcalls! {
+			#[no_mangle] pub unsafe extern "C"
+		}
 	);
 }
