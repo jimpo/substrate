@@ -120,11 +120,28 @@ fn deadline_to_timestamp(deadline: u64) -> Option<offchain::Timestamp> {
 		Some(offchain::Timestamp::from_unix_millis(deadline))
 	}
 }
-//lucet_hostcalls! {
-//#[no_mangle] pub unsafe extern "C"
-//fn __wasi_proc_exit(&mut vmctx, rval: wasm32::__wasi_exitcode_t,) -> ! {
-//wasi_proc_exit(vmctx, rval)
-//}
+
+lucet_hostcalls! {
+	#[no_mangle] pub unsafe extern "C"
+	fn __ext_print_hex(
+		&mut vmctx,
+		data_ptr: wasm32::uintptr_t,
+		data_len: wasm32::size_t,
+	) -> () {
+		wasi_proc_exit(vmctx, rval)
+	}
+
+    #[no_mangle] pub unsafe extern "C"
+    fn __wasi_fd_write(
+        &mut vmctx,
+        fd: wasm32::__wasi_fd_t,
+        data_ptr: wasm32::uintptr_t,
+        data_len: wasm32::size_t,
+        nwritten: wasm32::uintptr_t,
+    ) -> wasm32::__wasi_errno_t {
+        wasi_fd_write(vmctx, fd, iovs_ptr, iovs_len, nwritten)
+    }
+}
 
 impl_function_executor!(this: FunctionExecutor<'e, E>,
 	ext_print_utf8(utf8_data: *const u8, utf8_len: u32) => {

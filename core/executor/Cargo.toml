@@ -22,6 +22,8 @@ parking_lot = "0.9.0"
 log = "0.4"
 libsecp256k1 = "0.2.1"
 tiny-keccak = "1.4.2"
+hex = "0.3"
+lucet-runtime-internals = { version = "0.1", git = "https://github.com/fastly/lucet" }
 
 [dev-dependencies]
 assert_matches = "1.1"

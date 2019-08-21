@@ -76,6 +76,10 @@ pub enum Error {
 	/// Someone tried to allocate more memory than the allowed maximum per allocation.
 	#[display(fmt="Requested allocation size is too large")]
 	RequestedAllocationTooLarge,
+	#[display(fmt="Error loading compiled shared object for Wasm runtime: {}", _0)]
+	CompiledWasmLoad(lucet_runtime_internals::error::Error),
+	#[display(fmt="Error instantiating module for Wasm runtime: {}", _0)]
+	CompiledWasmInstantiate(lucet_runtime_internals::error::Error)
 }
 
 impl std::error::Error for Error {
@@ -84,6 +88,8 @@ impl std::error::Error for Error {
 			Error::InvalidData(ref err) => Some(err),
 			Error::Trap(ref err) => Some(err),
 			Error::Wasmi(ref err) => Some(err),
+			Error::CompiledWasmLoad(ref err) => Some(err),
+			Error::CompiledWasmInstantiate(ref err) => Some(err),
 			_ => None,
 		}
 	}

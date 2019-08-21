@@ -28,6 +28,7 @@
 #![warn(missing_docs)]
 #![recursion_limit="128"]
 
+mod compiled_wasm_executor;
 #[macro_use]
 mod wasm_utils;
 mod wasm_executor;
