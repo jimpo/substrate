@@ -19,8 +19,8 @@
 
 use crate::error::{Error, Result};
 use log::trace;
-use wasmi::MemoryRef;
-use wasmi::memory_units::Bytes;
+use std::convert::TryFrom;
+use wasmi::{MemoryRef, memory_units::Bytes};
 
 // The pointers need to be aligned to 8 bytes.
 const ALIGNMENT: u32 = 8;
@@ -33,10 +33,37 @@ const ALIGNMENT: u32 = 8;
 const N: usize = 22;
 const MAX_POSSIBLE_ALLOCATION: u32 = 16777216; // 2^24 bytes
 
-pub struct FreeingBumpHeapAllocator {
+/// Interface to a linear memory inside a Wasm module.
+pub trait LinearMemory {
+	/// Returns the current size in bytes of the linear memory.
+	fn len(&self) -> u32;
+
+	// Offset must be 8-byte aligned.
+	fn read_i64_le(&self, offset: u32) -> Result<i64>;
+
+	// Offset must be 8-byte aligned.
+	fn write_i64_le(&self, offset: u32, value: i64) -> Result<()>;
+}
+
+impl LinearMemory for MemoryRef {
+	fn len(&self) -> u32 {
+		let current_size: Bytes = self.current_size().into();
+		current_size.0 as u32
+	}
+
+	fn read_i64_le(&self, offset: u32) -> Result<i64> {
+		self.get_value(offset).map_err(Error::Wasmi)
+	}
+
+	fn write_i64_le(&self, offset: u32, value: i64) -> Result<()> {
+		self.set_value(offset, value).map_err(Error::Wasmi)
+	}
+}
+
+pub struct FreeingBumpHeapAllocator<M: LinearMemory> {
 	bumper: u32,
 	heads: [u32; N],
-	heap: MemoryRef,
+	heap: M,
 	max_heap_size: u32,
 	ptr_offset: u32,
 	total_size: u32,
@@ -47,7 +74,7 @@ fn error(msg: &'static str) -> Error {
 	Error::Allocator(msg)
 }
 
-impl FreeingBumpHeapAllocator {
+impl<M: LinearMemory> FreeingBumpHeapAllocator<M> {
 	/// Creates a new allocation heap which follows a freeing-bump strategy.
 	/// The maximum size which can be allocated at once is 16 MiB.
 	///
@@ -55,17 +82,14 @@ impl FreeingBumpHeapAllocator {
 	///
 	/// - `mem` - reference to the linear memory instance on which this allocator operates.
 	/// - `heap_base` - the offset from the beginning of the linear memory where the heap starts.
-	pub fn new(mem: MemoryRef, heap_base: u32) -> Self {
-		let current_size: Bytes = mem.current_size().into();
-		let current_size = current_size.0 as u32;
-
+	pub fn new(mem: M, heap_base: u32) -> Self {
 		let mut ptr_offset = heap_base;
 		let padding = ptr_offset % ALIGNMENT;
 		if padding != 0 {
 			ptr_offset += ALIGNMENT - padding;
 		}
 
-		let heap_size = current_size - ptr_offset;
+		let heap_size = mem.len() - ptr_offset;
 
 		FreeingBumpHeapAllocator {
 			bumper: 0,
@@ -94,17 +118,16 @@ impl FreeingBumpHeapAllocator {
 		let ptr: u32 = if self.heads[list_index] != 0 {
 			// Something from the free list
 			let item = self.heads[list_index];
-			let four_bytes = self.get_heap_4bytes(item)?;
-			self.heads[list_index] = FreeingBumpHeapAllocator::le_bytes_to_u32(four_bytes);
+			let next_item = u32::try_from(-self.heap.read_i64_le(item)?)
+				.map_err(|_| Error::Allocator("free list is corrupted"))?;
+			self.heads[list_index] = next_item;
 			item + 8
 		} else {
 			// Nothing to be freed. Bump.
 			self.bump(item_size + 8) + 8
 		};
 
-		(1..8).try_for_each(|i| self.set_heap(ptr - i, 255))?;
-
-		self.set_heap(ptr - 8, list_index as u8)?;
+		self.heap.write_i64_le(ptr - 8, -(list_index as i64))?;
 
 		self.total_size = self.total_size + item_size + 8;
 		trace!(target: "wasm-heap", "Heap size is {} bytes after allocation", self.total_size);
@@ -119,16 +142,16 @@ impl FreeingBumpHeapAllocator {
 			return Err(error("Invalid pointer for deallocation"));
 		}
 
-		let list_index = usize::from(self.get_heap_byte(ptr - 8)?);
-		(1..8).try_for_each(|i| self.get_heap_byte(ptr - i).map(|byte| assert!(byte == 255)))?;
-		let tail = self.heads[list_index];
+		let list_index = (-self.heap.read_i64_le(ptr - 8)?) as usize;
+		if list_index > (MAX_POSSIBLE_ALLOCATION.trailing_zeros() - 3) as usize {
+			return Err(Error::Allocator("attempted to deallocate invalid pointer"));
+		}
+
+		let prev_head = self.heads[list_index];
+		self.heap.write_i64_le(ptr - 8, -(prev_head as i64))?;
 		self.heads[list_index] = ptr - 8;
 
-		let mut slice = self.get_heap_4bytes(ptr - 8)?;
-		FreeingBumpHeapAllocator::write_u32_into_le_bytes(tail, &mut slice);
-		self.set_heap_4bytes(ptr - 8, slice)?;
-
-		let item_size = FreeingBumpHeapAllocator::get_item_size_from_index(list_index);
+		let item_size = Self::get_item_size_from_index(list_index);
 		self.total_size = self.total_size.checked_sub(item_size as u32 + 8)
 			.ok_or_else(|| error("Unable to subtract from total heap size without overflow"))?;
 		trace!(target: "wasm-heap", "Heap size is {} bytes after deallocation", self.total_size);
@@ -142,40 +165,10 @@ impl FreeingBumpHeapAllocator {
 		res
 	}
 
-	fn le_bytes_to_u32(arr: [u8; 4]) -> u32 {
-		u32::from_le_bytes(arr)
-	}
-
-	fn write_u32_into_le_bytes(bytes: u32, slice: &mut [u8]) {
-		let bytes: [u8; 4] = unsafe { std::mem::transmute::<u32, [u8; 4]>(bytes.to_le()) };
-		for i in 0..4 { slice[i] = bytes[i]; }
-	}
-
 	fn get_item_size_from_index(index: usize) -> usize {
 		// we shift 1 by three places, since the first possible item size is 8
 		1 << 3 << index
 	}
-
-	fn get_heap_4bytes(&mut self, ptr: u32) -> Result<[u8; 4]> {
-		let mut arr = [0u8; 4];
-		self.heap.get_into(self.ptr_offset + ptr, &mut arr)?;
-		Ok(arr)
-	}
-
-	fn get_heap_byte(&mut self, ptr: u32) -> Result<u8> {
-		let mut arr = [0u8; 1];
-		self.heap.get_into(self.ptr_offset + ptr, &mut arr)?;
-		Ok(arr[0])
-	}
-
-	fn set_heap(&mut self, ptr: u32, value: u8) -> Result<()> {
-		self.heap.set(self.ptr_offset + ptr, &[value]).map_err(Into::into)
-	}
-
-	fn set_heap_4bytes(&mut self, ptr: u32, value: [u8; 4]) -> Result<()> {
-		self.heap.set(self.ptr_offset + ptr, &value).map_err(Into::into)
-	}
-
 }
 
 #[cfg(test)]
@@ -432,29 +425,31 @@ mod tests {
 		assert_eq!(heap.total_size, 0);
 	}
 
-	#[test]
-	fn should_write_u32_correctly_into_le() {
-		// given
-		let mut heap = vec![0; 5];
-
-		// when
-		FreeingBumpHeapAllocator::write_u32_into_le_bytes(1, &mut heap[0..4]);
-
-		// then
-		assert_eq!(heap, [1, 0, 0, 0, 0]);
-	}
-
-	#[test]
-	fn should_write_u32_max_correctly_into_le() {
-		// given
-		let mut heap = vec![0; 5];
-
-		// when
-		FreeingBumpHeapAllocator::write_u32_into_le_bytes(u32::max_value(), &mut heap[0..4]);
-
-		// then
-		assert_eq!(heap, [255, 255, 255, 255, 0]);
-	}
+//	#[test]
+//	fn should_write_u32_correctly_into_le() {
+//		// given
+//		let mut heap = vec![0; 5];
+//
+//		// when
+//		<FreeingBumpHeapAllocator<MemoryRef>>::write_u32_into_le_bytes(1, &mut heap[0..4]);
+//
+//		// then
+//		assert_eq!(heap, [1, 0, 0, 0, 0]);
+//	}
+//
+//	#[test]
+//	fn should_write_u32_max_correctly_into_le() {
+//		// given
+//		let mut heap = vec![0; 5];
+//
+//		// when
+//		<FreeingBumpHeapAllocator<MemoryRef>>::write_u32_into_le_bytes(
+//			u32::max_value(), &mut heap[0..4]
+//		);
+//
+//		// then
+//		assert_eq!(heap, [255, 255, 255, 255, 0]);
+//	}
 
 	#[test]
 	fn should_get_item_size_from_index() {
@@ -462,7 +457,7 @@ mod tests {
 		let index = 0;
 
 		// when
-		let item_size = FreeingBumpHeapAllocator::get_item_size_from_index(index);
+		let item_size = <FreeingBumpHeapAllocator<MemoryRef>>::get_item_size_from_index(index);
 
 		// then
 		assert_eq!(item_size, 8);
@@ -474,7 +469,7 @@ mod tests {
 		let index = 21;
 
 		// when
-		let item_size = FreeingBumpHeapAllocator::get_item_size_from_index(index);
+		let item_size = <FreeingBumpHeapAllocator<MemoryRef>>::get_item_size_from_index(index);
 
 		// then
 		assert_eq!(item_size as u32, MAX_POSSIBLE_ALLOCATION);
