@@ -267,9 +267,14 @@ macro_rules! impl_function_executor {
 				};
 			}
 		}
-
-		lucet_hostcalls! {
-			#[no_mangle] pub unsafe extern "C"
-		}
 	);
 }
+//
+//macro_rules! lucet_hostcall {
+//	(
+//		$name:ident ( $( $names:ident : $params:ty ),* ) $( -> $returns:ty )? => { $( $body:tt )* }
+//		$( $tail:tt )*
+//	) => {
+//		#[no_mangle] pub unsafe extern "C"
+//		fn $name(&mut vmctx,
+//}
