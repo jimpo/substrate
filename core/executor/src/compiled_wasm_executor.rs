@@ -1,9 +1,10 @@
+use crate::allocator::LinearMemory;
 use crate::error::{Error, Result};
 
 use codec::{Decode, Encode};
 use hex;
 use lucet_runtime_internals::{
-	alloc::Limits,
+	alloc::{Alloc, Limits},
 	module::{DlModule, Module},
 	region::mmap::MmapRegion,
 };
@@ -33,6 +34,23 @@ impl CompiledWasmExecutor {
 			globals_size,
 			..Limits::default()
 		}
+	}
+}
+
+impl<'a> LinearMemory for &'a Alloc {
+	fn len(&self) -> u32 {
+		self.heap_len() as u32
+	}
+
+	fn read(&self, offset: u32, target: &mut [u8]) -> Result<()> {
+		unsafe {
+			self.slot().heap.offset(offset as isize)
+		}
+		unimplemented!()
+	}
+
+	fn write(&self, offset: u32, value: &[u8]) -> Result<()> {
+		unimplemented!()
 	}
 }
 
@@ -81,9 +99,9 @@ impl CodeExecutor<Blake2Hasher> for CompiledWasmExecutor {
 
 		// Construct args.
 
-		unsafe {
-			inst.alloc.heap()
-		}
+		// Build allocator.
+		let heap = unsafe { inst.alloc.heap() };
+
 		let heap_base = Self::get_heap_base(module_instance)?;
 		let parameters = {
 			let offset = fec.heap.allocate(data.len() as u32);

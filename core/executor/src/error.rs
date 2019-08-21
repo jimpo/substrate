@@ -88,8 +88,9 @@ impl std::error::Error for Error {
 			Error::InvalidData(ref err) => Some(err),
 			Error::Trap(ref err) => Some(err),
 			Error::Wasmi(ref err) => Some(err),
-			Error::CompiledWasmLoad(ref err) => Some(err),
-			Error::CompiledWasmInstantiate(ref err) => Some(err),
+			// the trait `std::error::Error` is not implemented for `lucet_runtime_internals::error::Error`
+			// Error::CompiledWasmLoad(ref err) => Some(err),
+			// Error::CompiledWasmInstantiate(ref err) => Some(err),
 			_ => None,
 		}
 	}
