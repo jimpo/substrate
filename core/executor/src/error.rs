@@ -19,6 +19,8 @@
 use state_machine;
 use serializer;
 use wasmi;
+use wasmtime_jit::ActionError;
+use wasmtime_runtime::InstantiationError;
 
 /// Result type alias.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -76,10 +78,16 @@ pub enum Error {
 	/// Someone tried to allocate more memory than the allowed maximum per allocation.
 	#[display(fmt="Requested allocation size is too large")]
 	RequestedAllocationTooLarge,
-	#[display(fmt="Error loading compiled shared object for Wasm runtime: {}", _0)]
-	CompiledWasmLoad(lucet_runtime_internals::error::Error),
-	#[display(fmt="Error instantiating module for Wasm runtime: {}", _0)]
-	CompiledWasmInstantiate(lucet_runtime_internals::error::Error)
+//	#[display(fmt="Error loading compiled shared object for Wasm runtime: {}", _0)]
+//	CompiledWasmLoad(lucet_runtime_internals::error::Error),
+//	#[display(fmt="Error instantiating module for Wasm runtime: {}", _0)]
+//	CompiledWasmInstantiate(lucet_runtime_internals::error::Error)
+	#[display(fmt="Wasmtime action error: {}", _0)]
+	WasmtimeAction(ActionError),
+	#[display(fmt="Wasmtime instantiation error: {}", _0)]
+	WasmtimeInstantiation(InstantiationError),
+	#[display(fmt="Wasmtime trapped: {}", _0)]
+	WasmtimeTrap(String),
 }
 
 impl std::error::Error for Error {
@@ -89,6 +97,8 @@ impl std::error::Error for Error {
 			Error::Trap(ref err) => Some(err),
 			Error::Wasmi(ref err) => Some(err),
 			// the trait `std::error::Error` is not implemented for `lucet_runtime_internals::error::Error`
+			// Error::WasmtimeAction(ref err) => Some(err),
+			// Error::WasmtimeInstantiation(ref err) => Some(err),
 			// Error::CompiledWasmLoad(ref err) => Some(err),
 			// Error::CompiledWasmInstantiate(ref err) => Some(err),
 			_ => None,
