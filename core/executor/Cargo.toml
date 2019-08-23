@@ -32,6 +32,7 @@ cranelift-wasm = "0.40"
 wasmtime-environ = "0.3"
 wasmtime-jit = "0.3"
 wasmtime-runtime = "0.3"
+target-lexicon = "0.4"
 
 [dev-dependencies]
 assert_matches = "1.1"
