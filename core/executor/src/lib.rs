@@ -30,6 +30,7 @@
 
 // mod compiled_wasm_executor;
 mod wasmtime_executor;
+mod wasmtime_utils;
 #[macro_use]
 mod wasm_utils;
 mod wasm_executor;

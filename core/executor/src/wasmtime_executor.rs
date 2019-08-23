@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 
-use cranelift_codegen::settings;
+use cranelift_codegen::{settings, ir, ir::types, isa};
 use cranelift_entity::PrimaryMap;
 use cranelift_wasm::DefinedFuncIndex;
 use primitives::Blake2Hasher;
@@ -9,9 +9,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem;
 use std::rc::Rc;
+use target_lexicon::HOST;
 use wasmtime_environ::{translate_signature, Module};
 use wasmtime_jit::{ActionOutcome, Context, Features};
-use wasmtime_runtime::{Imports, InstanceHandle, VMFunctionBody};
+use wasmtime_runtime::{Export, Imports, InstanceHandle, VMContext, VMFunctionBody};
 
 struct StateMachineContext {
 	ext: &'static mut dyn Externalities<Blake2Hasher>,
@@ -70,46 +71,46 @@ impl WasmtimeExecutor {
 	}
 }
 
+// TODO: It would be safer to return a value with 'a
 fn instantiate_env_module<E: Externalities<Blake2Hasher>>(
-	// prefix: &str,
-	global_exports: Rc<RefCell<HashMap<String, Option<wasmtime_runtime::Export>>>>,
+	global_exports: Rc<RefCell<HashMap<String, Option<Export>>>>,
 	ext: &mut E,
 	// preopened_dirs: &[(String, File)],
 	// argv: &[String],
 	// environ: &[(String, String)],
 ) -> Result<InstanceHandle> {
-	// let pointer_type = types::Type::triple_pointer_type(&HOST);
+	let pointer_type = types::Type::triple_pointer_type(&HOST);
 	let mut module = Module::new();
 	let mut finished_functions: PrimaryMap<DefinedFuncIndex, *const VMFunctionBody> =
 		PrimaryMap::new();
-	// let call_conv = isa::CallConv::triple_default(&HOST);
+	let call_conv = isa::CallConv::triple_default(&HOST);
 
-//	macro_rules! signature {
-//        ($name:ident) => {{
-//            let sig = module.signatures.push(translate_signature(
-//                ir::Signature {
-//                    params: syscalls::$name::params()
-//                        .into_iter()
-//                        .map(ir::AbiParam::new)
-//                        .collect(),
-//                    returns: syscalls::$name::results()
-//                        .into_iter()
-//                        .map(ir::AbiParam::new)
-//                        .collect(),
-//                    call_conv,
-//                },
-//                pointer_type,
-//            ));
-//            let func = module.functions.push(sig);
-//            module.exports.insert(
-//                prefix.to_owned() + stringify!($name),
-//                Export::Function(func),
-//            );
-//            finished_functions.push(syscalls::$name::SHIM as *const VMFunctionBody);
-//        }};
-//    }
-//
-//	signature!(args_get);
+	macro_rules! signature {
+        ($name:ident) => {{
+            let sig = module.signatures.push(translate_signature(
+                ir::Signature {
+                    params: syscalls::$name::params()
+                        .into_iter()
+                        .map(ir::AbiParam::new)
+                        .collect(),
+                    returns: syscalls::$name::results()
+                        .into_iter()
+                        .map(ir::AbiParam::new)
+                        .collect(),
+                    call_conv,
+                },
+                pointer_type,
+            ));
+            let func = module.functions.push(sig);
+            module.exports.insert(
+                stringify!($name).to_owned(),
+                wasmtime_environ::Export::Function(func),
+            );
+            finished_functions.push(syscalls::$name::SHIM as *const VMFunctionBody);
+        }};
+    }
+
+	signature!(ext_print_hex);
 
 	let imports = Imports::none();
 	let data_initializers = Vec::new();
@@ -139,5 +140,49 @@ fn instantiate_env_module<E: Externalities<Blake2Hasher>>(
 }
 
 mod syscalls {
+	use super::StateMachineContext;
+	use crate::def_syscalls;
+	use crate::wasmtime_utils::{AbiParam, AbiRet};
 
+	use cranelift_codegen::ir::types::Type;
+	use primitives::hexdisplay::HexDisplay;
+	use wasmtime_runtime::{Export, VMContext};
+
+	def_syscalls! {
+		pub unsafe extern "C" fn ext_print_hex(
+			vmctx: *mut VMContext,
+			data: u32, //wasm32::uintptr_t,
+			len: u32,
+		) -> () {
+			let memory = get_memory(&mut *vmctx);
+
+			let start = data as usize;
+			let end = start + len as usize;
+
+			if end <= memory.len() {
+				println!("{}", HexDisplay::from(&&memory[start..end]));
+			}
+		}
+	}
+
+	fn get_state_machine_ctx(vmctx: &mut VMContext) -> &mut StateMachineContext {
+		unsafe {
+			vmctx.host_state().downcast_mut::<StateMachineContext>()
+				.expect("!!! no host state named StateMachineContext available")
+		}
+	}
+
+	fn get_memory(vmctx: &mut VMContext) -> &mut [u8] {
+		unsafe {
+			// TODO: Make sure panicking is handled in an OK way.
+			match vmctx.lookup_global_export("memory") {
+				Some(Export::Memory { definition, vmctx: _, memory: _ }) =>
+					std::slice::from_raw_parts_mut(
+						(*definition).base,
+						(*definition).current_length,
+					),
+				_ => panic!("memory export is checked by validation (probably)"),
+			}
+		}
+	}
 }
