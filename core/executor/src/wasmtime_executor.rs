@@ -1,3 +1,4 @@
+use crate::allocator::OtherAllocator;
 use crate::error::{Error, Result};
 
 use cranelift_codegen::{settings, ir, ir::types, isa};
@@ -11,12 +12,12 @@ use std::mem;
 use std::rc::Rc;
 use target_lexicon::HOST;
 use wasmtime_environ::{translate_signature, Module};
-use wasmtime_jit::{ActionOutcome, Context, Features};
+use wasmtime_jit::{ActionOutcome, Context, Features, RuntimeValue};
 use wasmtime_runtime::{Export, Imports, InstanceHandle, VMContext, VMFunctionBody};
 
 struct StateMachineContext {
 	ext: &'static mut dyn Externalities<Blake2Hasher>,
-	// allocator
+	allocator: OtherAllocator,
 }
 
 struct WasmtimeExecutor;
@@ -57,17 +58,45 @@ impl WasmtimeExecutor {
 			.instantiate_module(None, &code)
 			.map_err(Error::WasmtimeAction)?;
 
+		// Allocate input data.
+		let data_len = data.len() as u32;
+		let data_ptr = {
+			let env_instance = context.get_instance("env")
+				.expect("context has instance with name \"env\"");
+			let state = env_instance.host_state().downcast_mut::<StateMachineContext>()
+				.expect("host_state of env instance is a StateMachineContext");
+			let heap_base = get_heap_base(&mut instance)?;
+			let memory = get_memory(&mut instance);
+			let heap = &mut memory[(heap_base as usize)..];
+
+			let data_offset = state.allocator.allocate(heap, data_len)?;
+			heap[(data_offset as usize)..((data_offset + data_len) as usize)].copy_from_slice(data);
+			heap_base + data_offset
+		};
+		let args = [RuntimeValue::I32(data_ptr as i32), RuntimeValue::I32(data_len as i32)];
+
 		// If a function to invoke was given, invoke it.
 		let outcome = context
-			.invoke(&mut instance, method, &[])
+			.invoke(&mut instance, method, &args[..])
 			.map_err(Error::WasmtimeAction)?;
-		match outcome {
-			ActionOutcome::Returned { .. } => {}
+		let (output_offset, output_len) = match outcome {
+			ActionOutcome::Returned { values } => {
+				if values.len()	!= 1 {
+					return Err(Error::InvalidReturn);
+				}
+				if let RuntimeValue::I64(val) = values[0] {
+					(val as u32, ((val as u64) >> 32) as u32)
+				} else {
+					return Err(Error::InvalidReturn);
+				}
+			}
 			ActionOutcome::Trapped { message } =>
 				return Err(Error::WasmtimeTrap(message)),
-		}
+		};
 
-		Ok(vec![])
+		let memory = get_memory(&mut instance);
+		let output = &memory[(output_offset as usize)..((output_offset + output_len) as usize)];
+		Ok(output.to_vec())
 	}
 }
 
@@ -118,11 +147,12 @@ fn instantiate_env_module<E: Externalities<Blake2Hasher>>(
 
 	let ext: &mut dyn Externalities<Blake2Hasher> = ext;
 
-	// Use unsafe to extend lifetime. This is OK because the context only lives as long as the
-	// instance.
+	// Use unsafe to extend lifetime of ext reference. This is OK because the context only lives as
+	// long as the instance.
 	let host_state = unsafe {
 		Box::new(StateMachineContext {
 			ext: mem::transmute::<_, &'static mut dyn Externalities<Blake2Hasher>>(ext),
+			allocator: OtherAllocator::new(),
 		})
 	};
 
@@ -184,5 +214,27 @@ mod syscalls {
 				_ => panic!("memory export is checked by validation (probably)"),
 			}
 		}
+	}
+}
+
+fn get_memory(instance: &mut InstanceHandle) -> &mut [u8] {
+	// TODO: Make sure panicking is handled in an OK way.
+	match instance.lookup("memory") {
+		Some(Export::Memory { definition, vmctx: _, memory: _ }) => unsafe {
+			std::slice::from_raw_parts_mut(
+				(*definition).base,
+				(*definition).current_length,
+			)
+		},
+		_ => panic!("memory export is checked by validation (probably)"),
+	}
+}
+
+fn get_heap_base(instance: &mut InstanceHandle) -> Result<u32> {
+	match instance.lookup("__heap_base") {
+		Some(Export::Global { definition, vmctx: _, global: _ }) => unsafe {
+			Ok(*(*definition).as_u32())
+		},
+		_ => return Err(Error::HeapBaseNotFoundOrInvalid),
 	}
 }
