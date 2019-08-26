@@ -19,7 +19,7 @@
 
 use crate::error::{Error, Result};
 use log::trace;
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 use wasmi::{MemoryRef, memory_units::Bytes};
 
 // The pointers need to be aligned to 8 bytes.
@@ -169,6 +169,108 @@ impl<M: LinearMemory> FreeingBumpHeapAllocator<M> {
 		// we shift 1 by three places, since the first possible item size is 8
 		1 << 3 << index
 	}
+}
+
+pub struct OtherAllocator {
+	bumper: u32,
+	heads: [u32; N],
+	total_size: u32,
+}
+
+impl OtherAllocator {
+	pub fn new() -> Self {
+		OtherAllocator {
+			bumper: 0,
+			heads: [0; N],
+			total_size: 0,
+		}
+	}
+
+	pub fn allocate(&mut self, heap: &mut [u8], size: u32) -> Result<u32> {
+		if size > MAX_POSSIBLE_ALLOCATION {
+			return Err(Error::RequestedAllocationTooLarge);
+		}
+
+		let size = size.max(8);
+		let item_size = size.next_power_of_two();
+
+		let list_index = (item_size.trailing_zeros() - 3) as usize;
+		let ptr = if self.heads[list_index] != 0 {
+			// Something from the free list
+			let item = self.heads[list_index];
+			let next_item: u32 = read_i64_le(heap, item)
+				.and_then(|offset| u32::try_from(offset).ok())
+				.ok_or_else(|| Error::Allocator("free list is corrupted"))?;
+			self.heads[list_index] = next_item;
+			item + 8
+		} else {
+			// Nothing to be freed. Bump.
+			self.bump(item_size + 8, heap.len() as u32)? + 8
+		};
+
+		write_i64_le(heap, ptr - 8, list_index as i64)
+			.ok_or_else(|| error("this should not happen, could probably panic"))?;
+
+		self.total_size += item_size + 8;
+		trace!(target: "wasm-heap", "Heap size is {} bytes after allocation", self.total_size);
+
+		Ok(ptr)
+	}
+
+	/// Deallocates the space which was allocated for a pointer.
+	pub fn deallocate(&mut self, heap: &mut [u8], ptr: u32) -> Result<()> {
+		if ptr < 8 {
+			return Err(error("Invalid pointer for deallocation"));
+		}
+
+		let list_index = read_i64_le(heap, ptr - 8)
+			.map(|item| item as usize)
+			.ok_or_else(|| error("this should not happen, could probably panic. heap must have shrunk"))?;
+		if list_index > (MAX_POSSIBLE_ALLOCATION.trailing_zeros() - 3) as usize {
+			return Err(Error::Allocator("attempted to deallocate invalid pointer"));
+		}
+
+		let prev_head = self.heads[list_index];
+		write_i64_le(heap, ptr - 8, prev_head as i64)
+			.ok_or_else(|| error("this should not happen, could probably panic. heap must have shrunk"))?;
+		self.heads[list_index] = ptr - 8;
+
+		let item_size = Self::get_item_size_from_index(list_index);
+		self.total_size = self.total_size.checked_sub(item_size as u32 + 8)
+			.ok_or_else(|| error("Unable to subtract from total heap size without overflow"))?;
+		trace!(target: "wasm-heap", "Heap size is {} bytes after deallocation", self.total_size);
+
+		Ok(())
+	}
+
+	fn bump(&mut self, n: u32, max_heap_size: u32) -> Result<u32> {
+		if self.bumper + n > max_heap_size {
+			return Err(Error::AllocatorOutOfSpace);
+		}
+
+		let res = self.bumper;
+		self.bumper += n;
+		Ok(res)
+	}
+
+	fn get_item_size_from_index(index: usize) -> usize {
+		// we shift 1 by three places, since the first possible item size is 8
+		1 << 3 << index
+	}
+}
+
+fn read_i64_le(heap: &[u8], offset: u32) -> Option<i64> {
+	let bytes = heap[(offset as usize)..((offset + 8) as usize)].try_into().ok()?;
+	Some(i64::from_le_bytes(bytes))
+}
+
+fn write_i64_le(heap: &mut [u8], offset: u32, val: i64) -> Option<()> {
+	if (offset + 8) as usize > heap.len() {
+		return None;
+	}
+
+	heap[(offset as usize)..((offset + 8) as usize)].copy_from_slice(&val.to_le_bytes()[..]);
+	Some(())
 }
 
 #[cfg(test)]
