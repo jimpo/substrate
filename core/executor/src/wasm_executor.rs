@@ -1035,7 +1035,7 @@ impl_function_executor!(this: FunctionExecutor<'e, E>,
 		new_value_len: u32
 	) -> u32 => {
 		let kind = offchain::StorageKind::try_from(kind)
-				.map_err(|_| "storage kind OOB while ext_local_storage_compare_and_set: wasm")?;
+			.map_err(|_| "storage kind OOB while ext_local_storage_compare_and_set: wasm")?;
 		let key = this.memory.get(key, key_len as usize)
 			.map_err(|_| "OOB while ext_local_storage_compare_and_set: wasm")?;
 		let new_value = this.memory.get(new_value, new_value_len as usize)

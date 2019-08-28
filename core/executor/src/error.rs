@@ -88,6 +88,10 @@ pub enum Error {
 	WasmtimeInstantiation(InstantiationError),
 	#[display(fmt="Wasmtime trapped: {}", _0)]
 	WasmtimeTrap(String),
+	#[display(fmt="Wasmtime VM context is invalid")]
+	InvalidWasmContext,
+	#[display(fmt="Error in env module: {}", _0)]
+	EnvModule(String),
 }
 
 impl std::error::Error for Error {
