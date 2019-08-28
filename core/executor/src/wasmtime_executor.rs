@@ -13,10 +13,15 @@ use std::mem;
 use std::rc::Rc;
 use target_lexicon::HOST;
 use wasmtime_environ::{translate_signature, Module};
-use wasmtime_jit::{ActionOutcome, Context, Features, RuntimeValue};
+use wasmtime_jit::{ActionOutcome, CompiledModule, Context, Features, RuntimeValue};
 use wasmtime_runtime::{Export, Imports, InstanceHandle, VMContext, VMFunctionBody};
 
 pub struct WasmtimeExecutor;
+
+thread_local! {
+	// static ENV_INSTANCE: RefCell<InstanceHandle> = RefCell::new();
+	// static MODULE_CACHE: RefCell<ModuleCache> = RefCell::new(ModuleCache::new());
+}
 
 impl WasmtimeExecutor {
 	pub fn call_with_code_in_storage<E: Externalities<Blake2Hasher>>(
@@ -39,10 +44,6 @@ impl WasmtimeExecutor {
 		method: &str,
 		data: &[u8],
 	) -> Result<Vec<u8>> {
-		let code = ext
-			.original_storage(well_known_keys::CODE)
-			.ok_or(Error::InvalidCode("`CODE` not found in storage.".into()))?;
-
 		let isa_builder = cranelift_native::builder().unwrap_or_else(|reason| {
 			panic!("host machine is not a supported target: {}", reason);
 		});
@@ -59,6 +60,7 @@ impl WasmtimeExecutor {
 
 		context.name_instance(
 			"env".to_owned(),
+			// TODO: Cache this and just reset the host_state on each invocation.
 			instantiate_env_module(global_exports, ext)?
 		);
 
@@ -1387,3 +1389,11 @@ fn get_heap_base(instance: &mut InstanceHandle) -> Result<u32> {
 		_ => return Err(Error::HeapBaseNotFoundOrInvalid),
 	}
 }
+
+//pub struct ModuleCache {
+//	/// A cache of runtime instances along with metadata, ready to be reused.
+//	///
+//	/// Instances are keyed by the hash of their code.
+//	// instances: HashMap<[u8; 32], Result<(CompiledModule, InstanceHandle), CacheError>>,
+//}
+
