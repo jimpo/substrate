@@ -744,7 +744,12 @@ mod syscalls {
 			let id: [u8; 4] = this.memory.read(id_data, 4)?.try_into().unwrap();
 			let key_type = KeyTypeId(id);
 
-			let keys = runtime_io::ed25519_public_keys(key_type).encode();
+			let keys = this.ext
+				.keystore()
+				.ok_or("No `keystore` associated for the current context!")?
+				.read()
+				.ed25519_public_keys(key_type)
+				.encode();
 
 			let len = keys.len() as Wasm32Size;
 			let ptr = this.memory.allocate(len)?;
@@ -801,7 +806,12 @@ mod syscalls {
 						.map_err(|_| "Seed not a valid utf8 string in ext_sr25119_generate")
 				).transpose()?;
 
-			let pubkey = runtime_io::ed25519_generate(key_type, seed);
+			let pubkey = this.ext
+				.keystore()
+				.ok_or("No `keystore` associated for the current context!")?
+				.write()
+				.ed25519_generate_new(key_type, seed)
+				.map_err(|_| "`ed25519` key generation failed")?;
 
 			this.memory.write(out, pubkey.as_ref())
 				.map_err(|_| "Invalid attempt to set out in ext_ed25519_generate".into())
@@ -827,7 +837,12 @@ mod syscalls {
 			let msg = this.memory.read(msg_data, msg_len)
 				.map_err(|_| "Invalid attempt to get message in ext_ed25519_sign")?;
 
-			let signature = runtime_io::ed25519_sign(key_type, &ed25519::Public(pubkey), &msg);
+			let signature = this.ext
+				.keystore()
+				.ok_or("No `keystore` associated for the current context!")?
+				.read()
+				.ed25519_key_pair(key_type, &pub_key)
+				.map(|k| k.sign(msg.as_ref()));
 
 			match signature {
 				Some(signature) => {
@@ -850,7 +865,12 @@ mod syscalls {
 				.map_err(|_| "Invalid attempt to get id in ext_sr25519_public_keys")?;
 			let key_type = KeyTypeId(id);
 
-			let keys = runtime_io::sr25519_public_keys(key_type).encode();
+			let keys = this.ext
+				.keystore()
+				.ok_or("No `keystore` associated for the current context!")?
+				.read()
+				.sr25519_public_keys(key_type)
+				.encode();
 
 			let len = keys.len() as u32;
 			let offset = this.memory.allocate(len)?;
@@ -911,7 +931,12 @@ mod syscalls {
 				)
 				.transpose()?;
 
-			let pubkey = runtime_io::sr25519_generate(key_type, seed);
+			let pubkey = this.ext
+				.keystore()
+				.ok_or("No `keystore` associated for the current context!")?
+				.write()
+				.sr25519_generate_new(key_type, seed)
+				.map_err(|_| "`sr25519` key generation failed")?;
 
 			this.memory.write(out, pubkey.as_ref())
 				.map_err(|_| "Invalid attempt to set out in ext_sr25519_generate".into())
@@ -937,7 +962,15 @@ mod syscalls {
 			let msg = this.memory.read(msg_data, msg_len)
 				.map_err(|_| "Invalid attempt to get message in ext_sr25519_sign")?;
 
-			let signature = runtime_io::sr25519_sign(key_type, &sr25519::Public(pubkey), &msg);
+			let pub_key = sr25519::Public::try_from(pubkey.as_ref())
+				.map_err(|_| "Invalid `sr25519` public key")?;
+
+			let signature = this.ext
+				.keystore()
+				.ok_or("No `keystore` associated for the current context!")?
+				.read()
+				.sr25519_key_pair(key_type, &pub_key)
+				.map(|k| k.sign(msg.as_ref()));
 
 			match signature {
 				Some(signature) => {
@@ -984,11 +1017,9 @@ mod syscalls {
 		}
 
 		ext_is_validator(&this) -> Result<u32> {
-			Ok(if runtime_io::is_validator() {
-				1
-			} else {
-				0
-			})
+			this.ext.offchain()
+				.map(|o| if o.is_validator() { 1 } else { 0 })
+				.ok_or("Calling unavailable API ext_is_validator: wasm".into())
 		}
 
 		ext_submit_transaction(&this, msg_data: Wasm32Ptr, len: Wasm32Size) -> Result<u32> {
@@ -1114,7 +1145,7 @@ mod syscalls {
 				.map_err(|_| "OOB while ext_local_storage_compare_and_set: wasm")?;
 
 			let res = {
-				if old_value == u32::max_value() {
+				if old_value_len == u32::max_value() {
 					this.ext.offchain()
 						.map(|api| api.local_storage_compare_and_set(kind, &key, None, &new_value))
 						.ok_or_else(|| "Calling unavailable API ext_local_storage_compare_and_set: wasm")?
