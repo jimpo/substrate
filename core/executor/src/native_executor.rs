@@ -17,6 +17,7 @@
 use std::{result, cell::RefCell, panic::UnwindSafe};
 use crate::error::{Error, Result};
 use state_machine::{CodeExecutor, Externalities};
+use crate::wasmtime_executor::WasmtimeExecutor;
 use crate::wasm_executor::WasmExecutor;
 use runtime_version::{NativeVersion, RuntimeVersion};
 use codec::{Decode, Encode};
@@ -158,21 +159,25 @@ impl<D: NativeExecutionDispatch> CodeExecutor<Blake2Hasher> for NativeExecutor<D
 							.map_or_else(||"<None>".into(), |v| format!("{}", v))
 					);
 					(
-						cached_runtime.with(|module|
-							self.fallback
-								.call_in_wasm_module(ext, module, method, data)
-								.map(NativeOrEncoded::Encoded)
-						),
+//						cached_runtime.with(|module|
+//							self.fallback
+//								.call_in_wasm_module(ext, module, method, data)
+//								.map(NativeOrEncoded::Encoded)
+//						),
+						WasmtimeExecutor::call_with_code_in_storage(ext, method, data)
+							.map(NativeOrEncoded::Encoded),
 						false
 					)
 				}
 				(false, _, _) => {
 					(
-						cached_runtime.with(|module|
-							self.fallback
-								.call_in_wasm_module(ext, module, method, data)
-								.map(NativeOrEncoded::Encoded)
-						),
+						WasmtimeExecutor::call_with_code_in_storage(ext, method, data)
+							.map(NativeOrEncoded::Encoded),
+//						cached_runtime.with(|module|
+//							self.fallback
+//								.call_in_wasm_module(ext, module, method, data)
+//								.map(NativeOrEncoded::Encoded)
+//						),
 						false
 					)
 				}

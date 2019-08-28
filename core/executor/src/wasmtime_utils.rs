@@ -1,3 +1,5 @@
+use crate::wasm_env::EnvContext;
+
 use cranelift_codegen::ir::types::{Type, I32, I64};
 
 pub trait AbiRet {
@@ -73,7 +75,7 @@ impl AbiRet for () {
 
 #[macro_export]
 macro_rules! def_syscalls {
-    ($(pub unsafe extern "C" fn $name:ident($ctx:ident: *mut VMContext $(, $arg:ident: $ty:ty)*,) -> $ret:ty {
+    ($($name:ident(&$ctx:ident $(, $arg:ident: $ty:ty)* $(,)?) -> Result<$ret:ty> {
         $($body:tt)*
     })*) => ($(
         pub mod $name {
@@ -101,16 +103,19 @@ macro_rules! def_syscalls {
             ) -> <$ret as AbiRet>::Abi = shim;
 
             unsafe extern "C" fn shim(
-                $ctx: *mut VMContext,
+                vmctx: *mut VMContext,
                 $($arg: <$ty as AbiParam>::Abi,)*
             ) -> <$ret as AbiRet>::Abi {
-                let r = super::$name($ctx, $(<$ty as AbiParam>::convert($arg),)*);
+            	let $ctx = EnvContext::new(vmctx)
+            		.expect("must be able to construct EnvContext from valid *mut VMContext");
+                let r = super::$name($ctx, $(<$ty as AbiParam>::convert($arg),)*).unwrap();
                 <$ret as AbiRet>::convert(r)
             }
         }
 
-        pub unsafe extern "C" fn $name($ctx: *mut VMContext, $($arg: $ty,)*) -> $ret {
+        pub unsafe fn $name(mut $ctx: EnvContext, $($arg: $ty,)*) -> Result<$ret> {
             $($body)*
         }
     )*)
 }
+// Maybe don't need  the extern "C" on the outer func?

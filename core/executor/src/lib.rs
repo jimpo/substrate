@@ -29,6 +29,7 @@
 #![recursion_limit="128"]
 
 // mod compiled_wasm_executor;
+mod wasm_env;
 mod wasmtime_executor;
 mod wasmtime_utils;
 #[macro_use]
