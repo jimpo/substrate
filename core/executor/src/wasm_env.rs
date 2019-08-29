@@ -7,7 +7,7 @@ use state_machine::Externalities;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::mem::size_of;
-use wasmtime_runtime::{Export, VMContext};
+use wasmtime_runtime::{Export, VMContext, InstanceHandle};
 
 pub type Wasm32Ptr = u32;
 pub type Wasm32Size = u32;
@@ -42,9 +42,11 @@ impl<'a> EnvContext<'a> {
 					(*definition).base,
 					(*definition).current_length,
 				),
-			_ => return Err(Error::InvalidWasmContext),
+			_ => return Err(Error::Other("no such memory export")),
+			// _ => return Err(Error::InvalidWasmContext),
 		};
-		let state = (*vmctx).host_state().downcast_mut::<StateMachineContext>()
+		let state = (*vmctx).host_state().downcast_mut::<Option<StateMachineContext>>()
+			.and_then(|maybe_ctx| maybe_ctx.as_mut())
 			.ok_or_else(|| Error::InvalidWasmContext)?;
 		let heap_base = match (*vmctx).lookup_global_export("__heap_base") {
 			Some(Export::Global { definition, vmctx: _, global: _ }) =>
@@ -65,6 +67,21 @@ impl<'a> EnvContext<'a> {
 			formatter,
 		})
 	}
+
+//	pub fn from_instance(instance: InstanceHandle) -> Result<Self> {
+//		match instance.lookup("memory") {
+//			Some(Export::Memory { definition, vmctx: _, memory: _ }) => unsafe {
+//				std::slice::from_raw_parts_mut(
+//					(*definition).base,
+//					(*definition).current_length,
+//				)
+//			},
+//			_ => return Err(Error::InvalidWasmContext),
+//		}
+//		Ok(EnvContext {
+//			ext: state.ext,
+//		})
+//	}
 }
 
 impl<'a> EnvMemory<'a> {
