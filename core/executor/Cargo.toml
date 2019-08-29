@@ -29,9 +29,9 @@ cranelift-codegen = "0.40"
 cranelift-entity = "0.40"
 cranelift-native = "0.40"
 cranelift-wasm = "0.40"
-wasmtime-environ = "0.3"
-wasmtime-jit = "0.3"
-wasmtime-runtime = "0.3"
+wasmtime-environ = { git = "https://github.com/jimpo/wasmtime", branch = "context-compile" }
+wasmtime-jit = { git = "https://github.com/jimpo/wasmtime", branch = "context-compile" }
+wasmtime-runtime = { git = "https://github.com/jimpo/wasmtime", branch = "context-compile" }
 target-lexicon = "0.4"
 
 [dev-dependencies]

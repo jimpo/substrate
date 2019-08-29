@@ -16,11 +16,11 @@
 
 //! Rust executor possible errors.
 
-use state_machine;
 use serializer;
+use state_machine;
+use std::sync::Arc;
 use wasmi;
-use wasmtime_jit::ActionError;
-use wasmtime_runtime::InstantiationError;
+use wasmtime_jit::{ActionError, SetupError};
 
 /// Result type alias.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -85,7 +85,7 @@ pub enum Error {
 	#[display(fmt="Wasmtime action error: {}", _0)]
 	WasmtimeAction(ActionError),
 	#[display(fmt="Wasmtime instantiation error: {}", _0)]
-	WasmtimeInstantiation(InstantiationError),
+	WasmtimeSetup(Arc<SetupError>),
 	#[display(fmt="Wasmtime trapped: {}", _0)]
 	WasmtimeTrap(String),
 	#[display(fmt="Wasmtime VM context is invalid")]

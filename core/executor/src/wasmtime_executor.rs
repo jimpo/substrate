@@ -1,6 +1,6 @@
 use crate::allocator::OtherAllocator;
 use crate::error::{Error, Result};
-use crate::wasm_env::StateMachineContext;
+use crate::wasm_env::{StateMachineContext, Wasm32Ptr, Wasm32Size};
 
 use cranelift_codegen::{settings, ir, ir::types, isa};
 use cranelift_entity::PrimaryMap;
@@ -8,19 +8,21 @@ use cranelift_wasm::DefinedFuncIndex;
 use primitives::{Blake2Hasher, storage::well_known_keys};
 use state_machine::Externalities;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::mem;
 use std::rc::Rc;
+use std::sync::Arc;
 use target_lexicon::HOST;
 use wasmtime_environ::{translate_signature, Module};
-use wasmtime_jit::{ActionOutcome, CompiledModule, Context, Features, RuntimeValue};
-use wasmtime_runtime::{Export, Imports, InstanceHandle, VMContext, VMFunctionBody};
+use wasmtime_jit::{ActionOutcome, CompiledModule, Context, Features, RuntimeValue, SetupError};
+use wasmtime_runtime::{
+	Export, Imports, InstanceHandle, VMContext, VMFunctionBody,
+};
 
 pub struct WasmtimeExecutor;
 
 thread_local! {
-	// static ENV_INSTANCE: RefCell<InstanceHandle> = RefCell::new();
-	// static MODULE_CACHE: RefCell<ModuleCache> = RefCell::new(ModuleCache::new());
+	static MODULE_CACHE: RefCell<ModuleCache> = RefCell::new(ModuleCache::new());
 }
 
 impl WasmtimeExecutor {
@@ -29,10 +31,11 @@ impl WasmtimeExecutor {
 		method: &str,
 		data: &[u8],
 	) -> Result<Vec<u8>> {
-		let code = ext
-			.original_storage(well_known_keys::CODE)
-			.ok_or(Error::InvalidCode("`CODE` not found in storage.".into()))?;
-		Self::call(ext, &code, method, data)
+		MODULE_CACHE.with(|cache| {
+			let mut cache = cache.borrow_mut();
+			let (module, context) = cache.fetch_runtime(ext)?;
+			Self::call(ext, module, context, method, data)
+		})
 	}
 
 	/// Call a given method in the given code.
@@ -40,50 +43,29 @@ impl WasmtimeExecutor {
 	/// Signature of this method needs to be `(I32, I32) -> I64`.
 	pub fn call<E: Externalities<Blake2Hasher>>(
 		ext: &mut E,
-		code: &[u8],
+		module: &mut CompiledModule,
+		context: &mut Context,
 		method: &str,
 		data: &[u8],
 	) -> Result<Vec<u8>> {
-		let isa_builder = cranelift_native::builder().unwrap_or_else(|reason| {
-			panic!("host machine is not a supported target: {}", reason);
-		});
-		let mut flag_builder = cranelift_codegen::settings::builder();
-		let mut features: Features = Default::default();
+		// Old exports get clobbered if we don't explicitly remove them first.
+		// TODO: open an issue on wasmtime and reference it here
+		{
+			let mut global_exports = context.get_global_exports();
+			let mut global_exports = global_exports.borrow_mut();
+			global_exports.remove("memory");
+			global_exports.remove("__heap_base");
+		}
 
-		let isa = isa_builder.finish(settings::Flags::new(flag_builder));
-		let mut context = Context::with_isa(isa).with_features(features);
+		let mut instance = module.instantiate()
+			.map_err(|e| Error::WasmtimeSetup(Arc::new(SetupError::Instantiate(e))))?;
 
-		// Enable/disable producing of debug info.
-		context.set_debug_info(true);
-
-		let global_exports = context.get_global_exports();
-
-		context.name_instance(
-			"env".to_owned(),
-			// TODO: Cache this and just reset the host_state on each invocation.
-			instantiate_env_module(global_exports, ext)?
-		);
-
-		// Compile and instantiating a wasm module.
-		let mut instance = context
-			.instantiate_module(None, &code)
-			.map_err(Error::WasmtimeAction)?;
+		unsafe {
+			reset_host_state(context, ext)?;
+		}
 
 		// Allocate input data.
-		let data_len = data.len() as u32;
-		let data_ptr = {
-			let env_instance = context.get_instance("env")
-				.expect("context has instance with name \"env\"");
-			let state = env_instance.host_state().downcast_mut::<StateMachineContext>()
-				.expect("host_state of env instance is a StateMachineContext");
-			let heap_base = get_heap_base(&mut instance)?;
-			let memory = get_memory(&mut instance);
-			let heap = &mut memory[(heap_base as usize)..];
-
-			let data_offset = state.allocator.allocate(heap, data_len)?;
-			heap[(data_offset as usize)..((data_offset + data_len) as usize)].copy_from_slice(data);
-			heap_base + data_offset
-		};
+		let (data_ptr, data_len) = inject_input_data(context, &mut instance, data)?;
 		let args = [RuntimeValue::I32(data_ptr as i32), RuntimeValue::I32(data_len as i32)];
 
 		// If a function to invoke was given, invoke it.
@@ -105,20 +87,66 @@ impl WasmtimeExecutor {
 				return Err(Error::WasmtimeTrap(message)),
 		};
 
+		clear_host_state(context)?;
+
 		let memory = get_memory(&mut instance);
 		let output = &memory[(output_offset as usize)..((output_offset + output_len) as usize)];
 		Ok(output.to_vec())
 	}
 }
 
+unsafe fn reset_host_state(context: &mut Context, ext: &mut dyn Externalities<Blake2Hasher>)
+	-> Result<()>
+{
+	let env_instance = context.get_instance("env")
+		.expect("context has instance with name \"env\"");
+	let mut state = env_instance.host_state().downcast_mut::<Option<StateMachineContext>>()
+		.expect("host_state of env instance is a StateMachineContext");
+	*state = Some(StateMachineContext {
+		ext: mem::transmute::<_, &'static mut dyn Externalities<Blake2Hasher>>(ext),
+		allocator: OtherAllocator::new(),
+		hash_lookup: HashMap::new(),
+	});
+	Ok(())
+}
+
+fn clear_host_state(context: &mut Context) -> Result<()> {
+	let env_instance = context.get_instance("env")
+		.map_err(|_| Error::InvalidWasmContext)?;
+	let state = env_instance.host_state().downcast_mut::<Option<StateMachineContext>>()
+		.ok_or_else(|| Error::InvalidWasmContext)?;
+	*state = None;
+	Ok(())
+}
+
+fn inject_input_data(
+	context: &mut Context,
+	instance: &mut InstanceHandle,
+	data: &[u8],
+) -> Result<(Wasm32Ptr, Wasm32Size)> {
+	let env_instance = context.get_instance("env")
+		.map_err(|_| Error::InvalidWasmContext)?;
+	let state = env_instance.host_state().downcast_mut::<Option<StateMachineContext>>()
+		.and_then(|maybe_state| maybe_state.as_mut())
+		.ok_or_else(|| Error::InvalidWasmContext)?;
+
+	let data_len = data.len() as u32;
+	let data_ptr = {
+		let heap_base = get_heap_base(instance)?;
+		let memory = get_memory(instance);
+		let heap = &mut memory[(heap_base as usize)..];
+
+		let data_offset = state.allocator.allocate(heap, data_len)?;
+		heap[(data_offset as usize)..((data_offset + data_len) as usize)].copy_from_slice(data);
+		heap_base + data_offset
+	};
+	Ok((data_ptr, data_len))
+}
+
 // TODO: It would be safer to return a value with 'a
-fn instantiate_env_module<E: Externalities<Blake2Hasher>>(
-	global_exports: Rc<RefCell<HashMap<String, Option<Export>>>>,
-	ext: &mut E,
-	// preopened_dirs: &[(String, File)],
-	// argv: &[String],
-	// environ: &[(String, String)],
-) -> Result<InstanceHandle> {
+fn instantiate_env_module(global_exports: Rc<RefCell<HashMap<String, Option<Export>>>>)
+	-> std::result::Result<InstanceHandle, SetupError>
+{
 	let pointer_type = types::Type::triple_pointer_type(&HOST);
 	let mut module = Module::new();
 	let mut finished_functions: PrimaryMap<DefinedFuncIndex, *const VMFunctionBody> =
@@ -213,18 +241,7 @@ fn instantiate_env_module<E: Externalities<Blake2Hasher>>(
 	let imports = Imports::none();
 	let data_initializers = Vec::new();
 	let signatures = PrimaryMap::new();
-
-	let ext: &mut dyn Externalities<Blake2Hasher> = ext;
-
-	// Use unsafe to extend lifetime of ext reference. This is OK because the context only lives as
-	// long as the instance.
-	let host_state = unsafe {
-		Box::new(StateMachineContext {
-			ext: mem::transmute::<_, &'static mut dyn Externalities<Blake2Hasher>>(ext),
-			allocator: OtherAllocator::new(),
-			hash_lookup: HashMap::new(),
-		})
-	};
+	let host_state = <Box<Option<StateMachineContext>>>::new(None);
 
 	let result = InstanceHandle::new(
 		Rc::new(module),
@@ -236,7 +253,7 @@ fn instantiate_env_module<E: Externalities<Blake2Hasher>>(
 		None,
 		host_state,
 	);
-	result.map_err(Error::WasmtimeInstantiation)
+	result.map_err(|e| SetupError::Instantiate(e))
 }
 
 mod syscalls {
@@ -837,6 +854,9 @@ mod syscalls {
 			let msg = this.memory.read(msg_data, msg_len)
 				.map_err(|_| "Invalid attempt to get message in ext_ed25519_sign")?;
 
+			let pub_key = ed25519::Public::try_from(pubkey.as_ref())
+				.map_err(|_| "Invalid `ed25519` public key")?;
+
 			let signature = this.ext
 				.keystore()
 				.ok_or("No `keystore` associated for the current context!")?
@@ -1332,60 +1352,60 @@ mod syscalls {
 		}
 
 		ext_sandbox_instantiate(
-			&this,
-			dispatch_thunk_idx: u32,
-			wasm_ptr: Wasm32Ptr,
-			wasm_len: Wasm32Size,
-			imports_ptr: Wasm32Ptr,
-			imports_len: Wasm32Size,
-			state: u32,
+			&_this,
+			_dispatch_thunk_idx: u32,
+			_wasm_ptr: Wasm32Ptr,
+			_wasm_len: Wasm32Size,
+			_imports_ptr: Wasm32Ptr,
+			_imports_len: Wasm32Size,
+			_state: u32,
 		) -> Result<u32> {
 			Err("Unimplemented".into())
 		}
 
-		ext_sandbox_instance_teardown(&this, instance_idx: u32) -> Result<()> {
+		ext_sandbox_instance_teardown(&_this, _instance_idx: u32) -> Result<()> {
 			Err("Unimplemented".into())
 		}
 
 		ext_sandbox_invoke(
-			&this,
-			instance_idx: u32,
-			export_ptr: Wasm32Ptr,
-			export_len: Wasm32Size,
-			args_ptr: Wasm32Ptr,
-			args_len: Wasm32Size,
-			return_val_ptr: Wasm32Ptr,
-			return_val_len: Wasm32Size,
-			state: u32,
+			&_this,
+			_instance_idx: u32,
+			_export_ptr: Wasm32Ptr,
+			_export_len: Wasm32Size,
+			_args_ptr: Wasm32Ptr,
+			_args_len: Wasm32Size,
+			_return_val_ptr: Wasm32Ptr,
+			_return_val_len: Wasm32Size,
+			_state: u32,
 		) -> Result<u32> {
 			Err("Unimplemented".into())
 		}
 
-		ext_sandbox_memory_new(&this, initial: u32, maximum: u32) -> Result<u32> {
+		ext_sandbox_memory_new(&_this, _initial: u32, _maximum: u32) -> Result<u32> {
 			Err("Unimplemented".into())
 		}
 
 		ext_sandbox_memory_get(
-			&this,
-			memory_idx: u32,
-			offset: u32,
-			buf_ptr: Wasm32Ptr,
-			buf_len: Wasm32Size,
+			&_this,
+			_memory_idx: u32,
+			_offset: u32,
+			_buf_ptr: Wasm32Ptr,
+			_buf_len: Wasm32Size,
 		) -> Result<u32> {
 			Err("Unimplemented".into())
 		}
 
 		ext_sandbox_memory_set(
-			&this,
-			memory_idx: u32,
-			offset: u32,
-			val_ptr: Wasm32Ptr,
-			val_len: Wasm32Size,
+			&_this,
+			_memory_idx: u32,
+			_offset: u32,
+			_val_ptr: Wasm32Ptr,
+			_val_len: Wasm32Size,
 		) -> Result<u32> {
 			Err("Unimplemented".into())
 		}
 
-		ext_sandbox_memory_teardown(&this, memory_idx: u32) -> Result<()> {
+		ext_sandbox_memory_teardown(&_this, _memory_idx: u32) -> Result<()> {
 			Err("Unimplemented".into())
 		}
 	}
@@ -1421,10 +1441,64 @@ fn get_heap_base(instance: &mut InstanceHandle) -> Result<u32> {
 	}
 }
 
-//pub struct ModuleCache {
-//	/// A cache of runtime instances along with metadata, ready to be reused.
-//	///
-//	/// Instances are keyed by the hash of their code.
-//	// instances: HashMap<[u8; 32], Result<(CompiledModule, InstanceHandle), CacheError>>,
-//}
+pub struct ModuleCache {
+	/// A cache of runtime instances along with metadata, ready to be reused.
+	///
+	/// Instances are keyed by the hash of their code.
+	instances: HashMap<[u8; 32], std::result::Result<(CompiledModule, Context), Arc<SetupError>>>,
+}
+
+impl ModuleCache {
+	/// Creates a new instance of a runtimes cache.
+	pub fn new() -> ModuleCache {
+		ModuleCache {
+			instances: HashMap::new(),
+		}
+	}
+
+	pub fn fetch_runtime(&mut self, ext: &mut dyn Externalities<Blake2Hasher>)
+		-> Result<&mut (CompiledModule, Context)>
+	{
+		let code_hash = ext
+			.original_storage_hash(well_known_keys::CODE)
+			.ok_or(Error::InvalidCode("`CODE` not found in storage.".into()))?;
+
+		// TODO: Limit memory consumption somehow by HEAP_PAGES?
+
+		let value = match self.instances.entry(code_hash.into()) {
+			Entry::Occupied(mut e) => e.into_mut(),
+			Entry::Vacant(e) => {
+				let code = ext
+					.original_storage(well_known_keys::CODE)
+					.ok_or(Error::InvalidCode("`CODE` not found in storage.".into()))?;
+				e.insert(create_compiled_unit(&code).map_err(|e| Arc::new(e)))
+			}
+		};
+		value.as_mut().map_err(|e| Error::WasmtimeSetup(e.clone()))
+	}
+}
+
+fn create_compiled_unit(code: &[u8]) -> std::result::Result<(CompiledModule, Context), SetupError>
+{
+	let isa_builder = cranelift_native::builder().unwrap_or_else(|reason| {
+		panic!("host machine is not a supported target: {}", reason);
+	});
+	let mut flag_builder = cranelift_codegen::settings::builder();
+	let mut features: Features = Default::default();
+
+	let isa = isa_builder.finish(settings::Flags::new(flag_builder));
+	let mut context = Context::with_isa(isa).with_features(features);
+
+	// Enable/disable producing of debug info.
+	context.set_debug_info(false);
+
+	let global_exports = context.get_global_exports();
+
+	let env_module = instantiate_env_module(global_exports)?;
+	context.name_instance("env".to_owned(), env_module);
+
+	// Compile and instantiating a wasm module.
+	let module = context.compile(&code)?;
+	Ok((module, context))
+}
 
