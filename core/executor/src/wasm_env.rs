@@ -37,13 +37,12 @@ pub struct EnvFormatter<'a> {
 impl<'a> EnvContext<'a> {
 	pub unsafe fn new(vmctx: *mut VMContext) -> Result<Self> {
 		let mem = match (*vmctx).lookup_global_export("memory") {
-			Some(Export::Memory { definition, vmctx: _, memory: _ }) =>
+			Some(Export::Memory { definition, vmctx: _, memory }) =>
 				std::slice::from_raw_parts_mut(
 					(*definition).base,
 					(*definition).current_length,
 				),
-			_ => return Err(Error::Other("no such memory export")),
-			// _ => return Err(Error::InvalidWasmContext),
+			_ => return Err(Error::InvalidWasmContext),
 		};
 		let state = (*vmctx).host_state().downcast_mut::<Option<StateMachineContext>>()
 			.and_then(|maybe_ctx| maybe_ctx.as_mut())
