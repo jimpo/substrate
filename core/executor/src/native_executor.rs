@@ -24,6 +24,7 @@ use codec::{Decode, Encode};
 use crate::RuntimeInfo;
 use primitives::{Blake2Hasher, NativeOrEncoded};
 use log::{trace, warn};
+use std::convert::TryInto;
 
 use crate::RuntimesCache;
 
@@ -133,6 +134,7 @@ impl<D: NativeExecutionDispatch> CodeExecutor<Blake2Hasher> for NativeExecutor<D
 		use_native: bool,
 		native_call: Option<NC>,
 	) -> (Result<NativeOrEncoded<R>>, bool){
+		let default_pages_u32 = self.default_heap_pages.and_then(|pages| pages.try_into().ok());
 		RUNTIMES_CACHE.with(|cache| {
 			let cache = &mut cache.borrow_mut();
 			let cached_runtime = match cache.fetch_runtime(
@@ -164,14 +166,18 @@ impl<D: NativeExecutionDispatch> CodeExecutor<Blake2Hasher> for NativeExecutor<D
 //								.call_in_wasm_module(ext, module, method, data)
 //								.map(NativeOrEncoded::Encoded)
 //						),
-						WasmtimeExecutor::call_with_code_in_storage(ext, method, data)
+						WasmtimeExecutor::call_with_code_in_storage(
+							ext, method, data, default_pages_u32
+						)
 							.map(NativeOrEncoded::Encoded),
 						false
 					)
 				}
 				(false, _, _) => {
 					(
-						WasmtimeExecutor::call_with_code_in_storage(ext, method, data)
+						WasmtimeExecutor::call_with_code_in_storage(
+							ext, method, data, default_pages_u32
+						)
 							.map(NativeOrEncoded::Encoded),
 //						cached_runtime.with(|module|
 //							self.fallback

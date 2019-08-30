@@ -2,6 +2,7 @@ use crate::allocator::OtherAllocator;
 use crate::error::{Error, Result};
 use crate::wasm_env::{StateMachineContext, Wasm32Ptr, Wasm32Size};
 
+use codec::Decode;
 use cranelift_codegen::{settings, ir, ir::types, isa};
 use cranelift_entity::PrimaryMap;
 use cranelift_wasm::DefinedFuncIndex;
@@ -13,13 +14,15 @@ use std::mem;
 use std::rc::Rc;
 use std::sync::Arc;
 use target_lexicon::HOST;
-use wasmtime_environ::{translate_signature, Module};
+use wasmtime_environ::{translate_signature, Module, WASM_PAGE_SIZE};
 use wasmtime_jit::{ActionOutcome, CompiledModule, Context, Features, RuntimeValue, SetupError};
 use wasmtime_runtime::{
 	Export, Imports, InstanceHandle, VMContext, VMFunctionBody,
 };
 
 pub struct WasmtimeExecutor;
+
+const DEFAULT_HEAP_PAGES: u32 = 1024;
 
 thread_local! {
 	static MODULE_CACHE: RefCell<ModuleCache> = RefCell::new(ModuleCache::new());
@@ -30,11 +33,12 @@ impl WasmtimeExecutor {
 		ext: &mut E,
 		method: &str,
 		data: &[u8],
+		default_heap_pages: Option<u32>,
 	) -> Result<Vec<u8>> {
 		MODULE_CACHE.with(|cache| {
 			let mut cache = cache.borrow_mut();
 			let (module, context) = cache.fetch_runtime(ext)?;
-			Self::call(ext, module, context, method, data)
+			Self::call(ext, module, context, method, data, default_heap_pages)
 		})
 	}
 
@@ -47,7 +51,14 @@ impl WasmtimeExecutor {
 		context: &mut Context,
 		method: &str,
 		data: &[u8],
+		default_heap_pages: Option<u32>,
 	) -> Result<Vec<u8>> {
+		let heap_pages = ext
+			.storage(well_known_keys::HEAP_PAGES)
+			.and_then(|pages| u32::decode(&mut &pages[..]).ok())
+			.or(default_heap_pages)
+			.unwrap_or(DEFAULT_HEAP_PAGES);
+
 		// Old exports get clobbered if we don't explicitly remove them first.
 		// TODO: open an issue on wasmtime and reference it here
 		{
@@ -61,6 +72,7 @@ impl WasmtimeExecutor {
 			.map_err(|e| Error::WasmtimeSetup(Arc::new(SetupError::Instantiate(e))))?;
 
 		unsafe {
+			grow_memory(&mut instance, heap_pages)?;
 			reset_host_state(context, ext)?;
 		}
 
@@ -93,6 +105,25 @@ impl WasmtimeExecutor {
 		let output = &memory[(output_offset as usize)..((output_offset + output_len) as usize)];
 		Ok(output.to_vec())
 	}
+}
+
+unsafe fn grow_memory(instance: &mut InstanceHandle, pages: u32) -> Result<()> {
+	let (memory_index, current_pages) = match instance.lookup_immutable("memory") {
+		Some(Export::Memory { definition, vmctx: _, memory }) => {
+			let definition = &*definition;
+			assert_eq!(
+				memory.memory.minimum.checked_mul(WASM_PAGE_SIZE),
+				Some(definition.current_length as u32)
+			);
+			let index = instance.memory_index(definition);
+			(index, memory.memory.minimum)
+		}
+		_ => return Err(Error::Other("memory export is checked by validation (probably)")),
+	};
+	if current_pages < pages {
+		instance.memory_grow(memory_index, pages - current_pages);
+	}
+	Ok(())
 }
 
 unsafe fn reset_host_state(context: &mut Context, ext: &mut dyn Externalities<Blake2Hasher>)
