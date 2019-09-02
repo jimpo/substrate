@@ -34,11 +34,12 @@ mod tests {
 	use super::Executor;
 	use {balances, contracts, indices, system, timestamp};
 	use runtime_io;
-	use substrate_executor::WasmExecutor;
 	use codec::{Encode, Decode, Joiner};
 	use runtime_support::{Hashable, StorageValue, StorageMap, assert_eq_error_rate, traits::Currency};
 	use state_machine::{CodeExecutor, Externalities, TestExternalities as CoreTestExternalities};
-	use primitives::{Blake2Hasher, NeverNativeValue, NativeOrEncoded, map};
+	use primitives::{
+		Blake2Hasher, NeverNativeValue, NativeOrEncoded, map, storage::well_known_keys,
+	};
 	use sr_primitives::traits::{Header as HeaderT, Hash as HashT, Convert};
 	use sr_primitives::{ApplyOutcome, ApplyError, ApplyResult};
 	use sr_primitives::weights::{WeightMultiplier, GetDispatchInfo};
@@ -111,6 +112,10 @@ mod tests {
 
 	fn executor() -> ::substrate_executor::NativeExecutor<Executor> {
 		substrate_executor::NativeExecutor::new(None)
+	}
+
+	fn set_heap_pages<E: Externalities<Blake2Hasher>>(ext: &mut E, heap_pages: u64) {
+		ext.place_storage(well_known_keys::HEAP_PAGES.to_vec(), Some(heap_pages.encode()));
 	}
 
 	#[test]
@@ -518,17 +523,30 @@ mod tests {
 	#[test]
 	fn full_wasm_block_import_works() {
 		let mut t = new_test_ext(COMPACT_CODE, false);
+		set_heap_pages(&mut t, 8);
 
 		let (block1, block2) = blocks();
 
-		WasmExecutor::new().call(&mut t, 8, COMPACT_CODE, "Core_execute_block", &block1.0).unwrap();
+		executor().call::<_, NeverNativeValue, fn() -> _>(
+			&mut t,
+			"Core_execute_block",
+			&block1.0,
+			false,
+			None,
+		).0.unwrap();
 
 		runtime_io::with_externalities(&mut t, || {
 			assert_eq!(Balances::total_balance(&alice()), 42 * DOLLARS - transfer_fee(&xt()));
 			assert_eq!(Balances::total_balance(&bob()), 169 * DOLLARS);
 		});
 
-		WasmExecutor::new().call(&mut t, 8, COMPACT_CODE, "Core_execute_block", &block2.0).unwrap();
+		executor().call::<_, NeverNativeValue, fn() -> _>(
+			&mut t,
+			"Core_execute_block",
+			&block2.0,
+			false,
+			None,
+		).0.unwrap();
 
 		runtime_io::with_externalities(&mut t, || {
 			assert_eq_error_rate!(
@@ -683,8 +701,15 @@ mod tests {
 		);
 
 		let mut t = new_test_ext(COMPACT_CODE, false);
+		set_heap_pages(&mut t, 8);
 
-		WasmExecutor::new().call(&mut t, 8, COMPACT_CODE,"Core_execute_block", &b.0).unwrap();
+		executor().call::<_, NeverNativeValue, fn() -> _>(
+			&mut t,
+			"Core_execute_block",
+			&b.0,
+			false,
+			None,
+		).0.unwrap();
 
 		runtime_io::with_externalities(&mut t, || {
 			// Verify that the contract constructor worked well and code of TRANSFER contract is actually deployed.
@@ -701,13 +726,14 @@ mod tests {
 	#[test]
 	fn wasm_big_block_import_fails() {
 		let mut t = new_test_ext(COMPACT_CODE, false);
+		set_heap_pages(&mut t, 4);
 
-		let result = WasmExecutor::new().call(
+		let (result, _) = executor().call::<_, NeverNativeValue, fn() -> _>(
 			&mut t,
-			4,
-			COMPACT_CODE,
 			"Core_execute_block",
-			&block_with_size(42, 0, 120_000).0
+			&block_with_size(42, 0, 120_000).0,
+			false,
+			None,
 		);
 		assert!(result.is_err()); // Err(Wasmi(Trap(Trap { kind: Host(AllocatorOutOfSpace) })))
 	}
@@ -752,12 +778,23 @@ mod tests {
 			<indices::NextEnumSet<Runtime>>::hashed_key().to_vec() => vec![0u8; 16],
 			<system::BlockHash<Runtime>>::hashed_key_for(0) => vec![0u8; 32]
 		], map![]));
+		set_heap_pages(&mut t, 8);
 
-		let r = WasmExecutor::new()
-			.call(&mut t, 8, COMPACT_CODE, "Core_initialize_block", &vec![].and(&from_block_number(1u32)));
+		let (r, _) = executor().call::<_, NeverNativeValue, fn() -> _>(
+			&mut t,
+			"Core_initialize_block",
+			&vec![].and(&from_block_number(1u32)),
+			false,
+			None,
+		);
 		assert!(r.is_ok());
-		let r = WasmExecutor::new()
-			.call(&mut t, 8, COMPACT_CODE, "BlockBuilder_apply_extrinsic", &vec![].and(&xt())).unwrap();
+		let r = executor().call::<_, NeverNativeValue, fn() -> _>(
+			&mut t,
+			"BlockBuilder_apply_extrinsic",
+			&vec![].and(&xt()),
+			false,
+			None,
+		).0.unwrap().into_encoded();
 		let r = ApplyResult::decode(&mut &r[..]).unwrap();
 		assert_eq!(r, Err(ApplyError::CantPay));
 	}
@@ -774,12 +811,23 @@ mod tests {
 			<indices::NextEnumSet<Runtime>>::hashed_key().to_vec() => vec![0u8; 16],
 			<system::BlockHash<Runtime>>::hashed_key_for(0) => vec![0u8; 32]
 		], map![]));
+		set_heap_pages(&mut t, 8);
 
-		let r = WasmExecutor::new()
-			.call(&mut t, 8, COMPACT_CODE, "Core_initialize_block", &vec![].and(&from_block_number(1u32)));
+		let (r, _) = executor().call::<_, NeverNativeValue, fn() -> _>(
+			&mut t,
+			"Core_initialize_block",
+			&vec![].and(&from_block_number(1u32)),
+			false,
+			None,
+		);
 		assert!(r.is_ok());
-		let r = WasmExecutor::new()
-			.call(&mut t, 8, COMPACT_CODE, "BlockBuilder_apply_extrinsic", &vec![].and(&xt())).unwrap();
+		let r = executor().call::<_, NeverNativeValue, fn() -> _>(
+			&mut t,
+			"BlockBuilder_apply_extrinsic",
+			&vec![].and(&xt()),
+			false,
+			None,
+		).0.unwrap().into_encoded();
 		let r = ApplyResult::decode(&mut &r[..]).unwrap();
 		assert_eq!(r, Ok(ApplyOutcome::Success));
 
@@ -812,7 +860,13 @@ mod tests {
 		let block1 = changes_trie_block();
 
 		let mut t = new_test_ext(COMPACT_CODE, true);
-		WasmExecutor::new().call(&mut t, 8, COMPACT_CODE, "Core_execute_block", &block1.0).unwrap();
+		executor().call::<_, NeverNativeValue, fn() -> _>(
+			&mut t,
+			"Core_execute_block",
+			&block1.0,
+			false,
+			None,
+		).0.unwrap();
 
 		assert!(t.storage_changes_root(GENESIS_HASH.into()).unwrap().is_some());
 	}
