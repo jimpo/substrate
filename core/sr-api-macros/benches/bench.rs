@@ -14,10 +14,12 @@
 // You should have received a copy of the GNU General Public License
 // along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
 
+use client::runtime_api::Core;
 use criterion::{Criterion, criterion_group, criterion_main};
 use test_client::{
-    DefaultTestClientBuilderExt, TestClientBuilder,
-    TestClientBuilderExt, runtime::TestAPI,
+	AccountKeyring, BlockBuilderExt, DefaultTestClientBuilderExt,
+	TestClientBuilder, TestClientBuilderExt,
+	runtime::{TestAPI, Transfer},
 };
 use sr_primitives::{generic::BlockId, traits::ProvideRuntimeApi};
 use state_machine::ExecutionStrategy;
@@ -65,6 +67,25 @@ fn sr_api_benchmark(c: &mut Criterion) {
 		let client = TestClientBuilder::new().set_execution_strategy(ExecutionStrategy::AlwaysWasm).build();
 		let block_id = BlockId::Number(client.info().chain.best_number);
 		b.iter(|| client.runtime_api().benchmark_direct_call(&block_id).unwrap())
+	});
+
+	c.bench_function("execute block in wasm", |b| {
+		let client = TestClientBuilder::new()
+			.set_execution_strategy(ExecutionStrategy::AlwaysWasm)
+			.build();
+		let block_id = BlockId::Number(client.info().chain.best_number);
+
+		// Build a new block to benchmark the import timing of.
+		let mut block_builder = client.new_block(Default::default()).unwrap();
+		block_builder.push_transfer(Transfer {
+			from: AccountKeyring::Alice.into(),
+			to: AccountKeyring::Ferdie.into(),
+			amount: 42,
+			nonce: 0,
+		}).unwrap();
+		let block = block_builder.bake().unwrap();
+
+		b.iter(|| client.runtime_api().execute_block(&block_id, block.clone()).unwrap())
 	});
 }
 
