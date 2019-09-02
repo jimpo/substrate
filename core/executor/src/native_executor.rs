@@ -26,10 +26,12 @@ use primitives::{Blake2Hasher, NativeOrEncoded};
 use log::{trace, warn};
 use std::convert::TryInto;
 
-use crate::RuntimesCache;
+use crate::wasm_runtimes_cache::{CachedRuntime, RuntimesCache, InterpretedRuntime, JITRuntimeCache, WasmJITRuntime};
+use crate::wasm_utils::WasmRuntime;
 
 thread_local! {
 	static RUNTIMES_CACHE: RefCell<RuntimesCache> = RefCell::new(RuntimesCache::new());
+	static JIT_RUNTIMES_CACHE: RefCell<JITRuntimeCache> = RefCell::new(JITRuntimeCache::new());
 }
 
 fn safe_call<F, U>(f: F) -> Result<U>
@@ -64,12 +66,11 @@ pub trait NativeExecutionDispatch: Send + Sync {
 pub struct NativeExecutor<D> {
 	/// Dummy field to avoid the compiler complaining about us not using `D`.
 	_dummy: ::std::marker::PhantomData<D>,
-	/// The fallback executor in case native isn't available.
-	fallback: WasmExecutor,
 	/// Native runtime version info.
 	native_version: NativeVersion,
 	/// The number of 64KB pages to allocate for Wasm execution.
 	default_heap_pages: Option<u64>,
+	use_jit: bool,
 }
 
 impl<D: NativeExecutionDispatch> NativeExecutor<D> {
@@ -77,9 +78,24 @@ impl<D: NativeExecutionDispatch> NativeExecutor<D> {
 	pub fn new(default_heap_pages: Option<u64>) -> Self {
 		NativeExecutor {
 			_dummy: Default::default(),
-			fallback: WasmExecutor::new(),
 			native_version: D::native_version(),
-			default_heap_pages: default_heap_pages,
+			default_heap_pages,
+			use_jit: false,
+		}
+	}
+
+	fn with_wasm_runtime<E, R>(
+		&self,
+		ext: &mut E,
+		f: impl for<'a> FnOnce(Box<dyn WasmRuntime<E> + 'a>) -> Result<R>
+	) -> Result<R>
+		where
+			E: Externalities<Blake2Hasher>,
+	{
+		if self.use_jit {
+			with_wasm_jit_runtime(ext, self.default_heap_pages, |runtime| f(Box::new(runtime)))
+		} else {
+			with_wasmi_runtime(ext, self.default_heap_pages, |runtime| f(Box::new(runtime)))
 		}
 	}
 }
@@ -88,9 +104,9 @@ impl<D: NativeExecutionDispatch> Clone for NativeExecutor<D> {
 	fn clone(&self) -> Self {
 		NativeExecutor {
 			_dummy: Default::default(),
-			fallback: self.fallback.clone(),
 			native_version: D::native_version(),
 			default_heap_pages: self.default_heap_pages,
+			use_jit: self.use_jit,
 		}
 	}
 }
@@ -104,17 +120,13 @@ impl<D: NativeExecutionDispatch> RuntimeInfo for NativeExecutor<D> {
 		&self,
 		ext: &mut E,
 	) -> Option<RuntimeVersion> {
-		RUNTIMES_CACHE.with(|cache| {
-			let cache = &mut cache.borrow_mut();
-
-			match cache.fetch_runtime(&self.fallback, ext, self.default_heap_pages) {
-				Ok(runtime) => runtime.version(),
-				Err(e) => {
-					warn!(target: "executor", "Failed to fetch runtime: {:?}", e);
-					None
-				}
+		match self.with_wasm_runtime(ext, |runtime| Ok(runtime.version())) {
+			Ok(version) => version,
+			Err(e) => {
+				warn!(target: "executor", "Failed to fetch runtime: {:?}", e);
+				None
 			}
-		})
+		}
 	}
 }
 
@@ -134,16 +146,9 @@ impl<D: NativeExecutionDispatch> CodeExecutor<Blake2Hasher> for NativeExecutor<D
 		use_native: bool,
 		native_call: Option<NC>,
 	) -> (Result<NativeOrEncoded<R>>, bool){
-		let default_pages_u32 = self.default_heap_pages.and_then(|pages| pages.try_into().ok());
-		RUNTIMES_CACHE.with(|cache| {
-			let cache = &mut cache.borrow_mut();
-			let cached_runtime = match cache.fetch_runtime(
-				&self.fallback, ext, self.default_heap_pages,
-			) {
-				Ok(cached_runtime) => cached_runtime,
-				Err(e) => return (Err(e), false),
-			};
-			let onchain_version = cached_runtime.version();
+		let mut used_native = false;
+		let result = self.with_wasm_runtime(ext, |mut runtime| {
+			let onchain_version = runtime.version();
 			match (
 				use_native,
 				onchain_version
@@ -160,33 +165,9 @@ impl<D: NativeExecutionDispatch> CodeExecutor<Blake2Hasher> for NativeExecutor<D
 							.as_ref()
 							.map_or_else(||"<None>".into(), |v| format!("{}", v))
 					);
-					(
-//						cached_runtime.with(|module|
-//							self.fallback
-//								.call_in_wasm_module(ext, module, method, data)
-//								.map(NativeOrEncoded::Encoded)
-//						),
-						WasmtimeExecutor::call_with_code_in_storage(
-							ext, method, data, default_pages_u32
-						)
-							.map(NativeOrEncoded::Encoded),
-						false
-					)
+					runtime.call(method, data).map(NativeOrEncoded::Encoded)
 				}
-				(false, _, _) => {
-					(
-						WasmtimeExecutor::call_with_code_in_storage(
-							ext, method, data, default_pages_u32
-						)
-							.map(NativeOrEncoded::Encoded),
-//						cached_runtime.with(|module|
-//							self.fallback
-//								.call_in_wasm_module(ext, module, method, data)
-//								.map(NativeOrEncoded::Encoded)
-//						),
-						false
-					)
-				}
+				(false, _, _) => runtime.call(method, data).map(NativeOrEncoded::Encoded),
 				(true, true, Some(call)) => {
 					trace!(
 						target: "executor",
@@ -196,11 +177,9 @@ impl<D: NativeExecutionDispatch> CodeExecutor<Blake2Hasher> for NativeExecutor<D
 							.as_ref()
 							.map_or_else(||"<None>".into(), |v| format!("{}", v))
 					);
-					(
-						with_native_environment(ext, move || (call)())
-							.and_then(|r| r.map(NativeOrEncoded::Native).map_err(|s| Error::ApiError(s.to_string()))),
-						true
-					)
+					used_native = true;
+					with_native_environment(runtime.ext(), move || (call)())
+						.and_then(|r| r.map(NativeOrEncoded::Native).map_err(|s| Error::ApiError(s.to_string())))
 				}
 				_ => {
 					trace!(
@@ -209,10 +188,12 @@ impl<D: NativeExecutionDispatch> CodeExecutor<Blake2Hasher> for NativeExecutor<D
 						self.native_version.runtime_version,
 						onchain_version.as_ref().map_or_else(||"<None>".into(), |v| format!("{}", v))
 					);
-					(D::dispatch(ext, method, data).map(NativeOrEncoded::Encoded), true)
+					used_native = true;
+					D::dispatch(runtime.ext(), method, data).map(NativeOrEncoded::Encoded)
 				}
 			}
-		})
+		});
+		(result, used_native)
 	}
 }
 
@@ -240,4 +221,32 @@ macro_rules! native_executor_instance {
 			}
 		}
 	}
+}
+
+fn with_wasmi_runtime<E, R>(
+	ext: &mut E,
+	default_heap_pages: Option<u64>,
+	f: impl for <'a> FnOnce(InterpretedRuntime<'a, E>) -> Result<R>,
+) -> Result<R>
+	where E: Externalities<Blake2Hasher>
+{
+	RUNTIMES_CACHE.with(|cache| {
+		let mut cache = cache.borrow_mut();
+		let runtime = cache.fetch_runtime(&WasmExecutor, ext, default_heap_pages)?;
+		f(runtime)
+	})
+}
+
+fn with_wasm_jit_runtime<E, R>(
+	ext: &mut E,
+	default_heap_pages: Option<u64>,
+	f: impl for <'a> FnOnce(WasmJITRuntime<'a, E>) -> Result<R>,
+) -> Result<R>
+	where E: Externalities<Blake2Hasher>
+{
+	JIT_RUNTIMES_CACHE.with(|cache| {
+		let mut cache = cache.borrow_mut();
+		let runtime = cache.fetch_runtime(ext, default_heap_pages)?;
+		f(runtime)
+	})
 }

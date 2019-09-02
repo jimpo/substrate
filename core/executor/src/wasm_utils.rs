@@ -16,6 +16,11 @@
 
 //! Rust implementation of Substrate contracts.
 
+use crate::error::Result;
+
+use primitives::{Blake2Hasher, H256};
+use runtime_version::RuntimeVersion;
+use state_machine::Externalities;
 use wasmi::{ValueType, RuntimeValue};
 use wasmi::nan_preserving_float::{F32, F64};
 
@@ -160,7 +165,7 @@ macro_rules! unmarshall_args {
 #[inline(always)]
 pub fn constrain_closure<R, F>(f: F) -> F
 where
-	F: FnOnce() -> Result<R, crate::error::Error>
+	F: FnOnce() -> Result<R>
 {
 	f
 }
@@ -278,3 +283,12 @@ macro_rules! impl_function_executor {
 //		#[no_mangle] pub unsafe extern "C"
 //		fn $name(&mut vmctx,
 //}
+
+// TODO: Rename WasmExecutor when WasmExecutor is renamed to WasmiExecutor.
+pub trait WasmRuntime<E>
+	where E: Externalities<Blake2Hasher>
+{
+	fn version(&self) -> Option<RuntimeVersion>;
+	fn call(&mut self, method: &str, data: &[u8]) -> Result<Vec<u8>>;
+	fn ext(&mut self) -> &mut E;
+}

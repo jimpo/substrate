@@ -18,17 +18,20 @@
 
 use crate::error::Error;
 use crate::wasm_executor::WasmExecutor;
+use crate::wasm_utils::WasmRuntime;
 use log::{trace, warn};
 use codec::Decode;
 use parity_wasm::elements::{deserialize_buffer, DataSegment, Instruction, Module as RawModule};
-use primitives::storage::well_known_keys;
-use primitives::Blake2Hasher;
+use primitives::{Blake2Hasher, H256, storage::well_known_keys};
 use runtime_version::RuntimeVersion;
 use state_machine::Externalities;
 use std::collections::hash_map::{Entry, HashMap};
 use std::mem;
-use std::rc::Rc;
 use wasmi::{Module as WasmModule, ModuleRef as WasmModuleInstanceRef, RuntimeValue};
+use wasmtime_jit::{CompiledModule, Context, SetupError};
+use std::sync::Arc;
+use std::convert::TryInto;
+use crate::wasmtime_executor::{create_compiled_unit, WasmtimeExecutor};
 
 #[derive(Debug)]
 enum CacheError {
@@ -72,7 +75,7 @@ impl CachedRuntime {
 	///
 	/// Returns `None` if the runtime doesn't provide the information or there was an error
 	/// while fetching it.
-	pub fn version(&self) -> Option<RuntimeVersion> {
+	fn version(&self) -> Option<RuntimeVersion> {
 		self.version.clone()
 	}
 }
@@ -196,7 +199,7 @@ pub struct RuntimesCache {
 	/// A cache of runtime instances along with metadata, ready to be reused.
 	///
 	/// Instances are keyed by the hash of their code.
-	instances: HashMap<[u8; 32], Result<Rc<CachedRuntime>, CacheError>>,
+	instances: HashMap<[u8; 32], Result<CachedRuntime, CacheError>>,
 }
 
 impl RuntimesCache {
@@ -240,32 +243,28 @@ impl RuntimesCache {
 	///
 	/// `Error::InvalidMemoryReference` is returned if no memory export with the
 	/// identifier `memory` can be found in the runtime.
-	pub fn fetch_runtime<E: Externalities<Blake2Hasher>>(
-		&mut self,
+	pub fn fetch_runtime<'a, E: Externalities<Blake2Hasher>>(
+		&'a mut self,
 		wasm_executor: &WasmExecutor,
-		ext: &mut E,
+		ext: &'a mut E,
 		default_heap_pages: Option<u64>,
-	) -> Result<Rc<CachedRuntime>, Error> {
-		let code_hash = ext
-			.original_storage_hash(well_known_keys::CODE)
-			.ok_or(Error::InvalidCode("`CODE` not found in storage.".into()))?;
-
-		let heap_pages = ext
-			.storage(well_known_keys::HEAP_PAGES)
-			.and_then(|pages| u64::decode(&mut &pages[..]).ok())
-			.or(default_heap_pages)
-			.unwrap_or(DEFAULT_HEAP_PAGES);
+	) -> Result<InterpretedRuntime<'a, E>, Error> {
+		let code_hash = get_code_hash(ext)?;
+		let heap_pages = get_heap_pages(ext, default_heap_pages);
 
 		// This is direct result from fighting with borrowck.
-		let handle_result =
-			|cached_result: &Result<Rc<CachedRuntime>, CacheError>| match *cached_result {
-				Err(ref e) => Err(Error::InvalidCode(format!("{:?}", e))),
-				Ok(ref cached_runtime) => Ok(Rc::clone(cached_runtime)),
-			};
+//		let handle_result =
+//			|cached_result: &Result<CachedRuntime, CacheError>| match *cached_result {
+//				Err(ref e) => Err(Error::InvalidCode(format!("{:?}", e))),
+//				Ok(ref mut cached_runtime) => Ok(InterpretedRuntime {
+//					cached_runtime,
+//					ext,
+//				}),
+//			};
 
-		match self.instances.entry(code_hash.into()) {
-			Entry::Occupied(mut o) => {
-				let result = o.get_mut();
+		let cached_result = match self.instances.entry(code_hash.into()) {
+			Entry::Occupied(o) => {
+				let result = o.into_mut();
 				if let Ok(ref cached_runtime) = result {
 					if cached_runtime.state_snapshot.heap_pages != heap_pages {
 						trace!(
@@ -278,16 +277,23 @@ impl RuntimesCache {
 						}
 					}
 				}
-				handle_result(result)
-			},
+				result
+			}
 			Entry::Vacant(v) => {
 				trace!(target: "runtimes_cache", "no instance found in cache, creating now.");
 				let result = Self::create_wasm_instance(wasm_executor, ext, heap_pages);
 				if let Err(ref err) = result {
 					warn!(target: "runtimes_cache", "cannot create a runtime: {:?}", err);
 				}
-				handle_result(v.insert(result))
+				v.insert(result)
 			}
+		};
+		match *cached_result {
+			Ok(ref mut cached_runtime) => Ok(InterpretedRuntime {
+				cached_runtime,
+				ext,
+			}),
+			Err(ref e) => Err(Error::InvalidCode(format!("{:?}", e))),
 		}
 	}
 
@@ -295,7 +301,7 @@ impl RuntimesCache {
 		wasm_executor: &WasmExecutor,
 		ext: &mut E,
 		heap_pages: u64,
-	) -> Result<Rc<CachedRuntime>, CacheError> {
+	) -> Result<CachedRuntime, CacheError> {
 		let code = ext
 			.original_storage(well_known_keys::CODE)
 			.ok_or(CacheError::CodeNotFound)?;
@@ -324,11 +330,11 @@ impl RuntimesCache {
 			.call_in_wasm_module(ext, &instance, "Core_version", &[])
 			.ok()
 			.and_then(|v| RuntimeVersion::decode(&mut v.as_slice()).ok());
-		Ok(Rc::new(CachedRuntime {
+		Ok(CachedRuntime {
 			instance,
 			version,
 			state_snapshot,
-		}))
+		})
 	}
 }
 
@@ -343,4 +349,123 @@ fn extract_data_segments(wasm_code: &[u8]) -> Option<Vec<DataSegment>> {
 		.unwrap_or(&[])
 		.to_vec();
 	Some(segments)
+}
+
+impl<'a, E> WasmRuntime<E> for InterpretedRuntime<'a, E>
+	where E: Externalities<Blake2Hasher>
+{
+	/// Returns the version of this cached runtime.
+	///
+	/// Returns `None` if the runtime doesn't provide the information or there was an error
+	/// while fetching it.
+	fn version(&self) -> Option<RuntimeVersion> {
+		self.cached_runtime.version()
+	}
+
+	fn call(&mut self, method: &str, data: &[u8]) -> Result<Vec<u8>, Error>
+		where E: Externalities<Blake2Hasher>
+	{
+		self.cached_runtime.with(|module| {
+			WasmExecutor.call_in_wasm_module(self.ext, module, method, data)
+		})
+	}
+
+	fn ext(&mut self) -> &mut E {
+		self.ext
+	}
+}
+
+pub struct InterpretedRuntime<'a, E>
+	where E: Externalities<Blake2Hasher>
+{
+	cached_runtime: &'a CachedRuntime,
+	ext: &'a mut E,
+}
+
+fn get_code_hash<E: Externalities<Blake2Hasher>>(ext: &E) -> Result<H256, Error> {
+	ext.original_storage_hash(well_known_keys::CODE)
+		.ok_or(Error::InvalidCode("`CODE` not found in storage.".into()))
+}
+
+fn get_heap_pages<E: Externalities<Blake2Hasher>>(ext: &E, default_heap_pages: Option<u64>) -> u64 {
+	ext.storage(well_known_keys::HEAP_PAGES)
+		.and_then(|pages| u64::decode(&mut &pages[..]).ok())
+		.or(default_heap_pages)
+		.unwrap_or(DEFAULT_HEAP_PAGES)
+}
+
+
+pub struct JITRuntimeCache {
+	/// A cache of runtime instances along with metadata, ready to be reused.
+	///
+	/// Instances are keyed by the hash of their code.
+	instances: HashMap<[u8; 32], Result<(CompiledModule, Context), Arc<SetupError>>>,
+}
+
+impl JITRuntimeCache {
+	/// Creates a new instance of a runtimes cache.
+	pub fn new() -> JITRuntimeCache {
+		JITRuntimeCache {
+			instances: HashMap::new(),
+		}
+	}
+
+	pub fn fetch_runtime<'a, E>(&'a mut self, ext: &'a mut E, default_heap_pages: Option<u64>)
+		-> Result<WasmJITRuntime<'a, E>, Error>
+		where E: Externalities<Blake2Hasher>
+	{
+		let code_hash = get_code_hash(ext)?;
+
+		let value = match self.instances.entry(code_hash.into()) {
+			Entry::Occupied(mut e) => e.into_mut(),
+			Entry::Vacant(e) => {
+				let code = ext
+					.original_storage(well_known_keys::CODE)
+					.ok_or(Error::InvalidCode("`CODE` not found in storage.".into()))?;
+				e.insert(create_compiled_unit(&code).map_err(|e| Arc::new(e)))
+			}
+		};
+		let (module, context) = value.as_mut().map_err(|e| Error::WasmtimeSetup(e.clone()))?;
+		let heap_pages: u32 = get_heap_pages(ext, default_heap_pages)
+			.try_into()
+			.map_err(|_| Error::Other("heap_pages is too high"))?;
+
+		let version = WasmtimeExecutor::call(ext, module, context, "Core_version", &[], heap_pages)
+			.ok()
+			.and_then(|v| RuntimeVersion::decode(&mut v.as_slice()).ok());
+
+		Ok(WasmJITRuntime {
+			module,
+			context,
+			heap_pages,
+			ext,
+			version,
+		})
+	}
+}
+
+pub struct WasmJITRuntime<'a, E>
+	where E: Externalities<Blake2Hasher>
+{
+	module: &'a mut CompiledModule,
+	context: &'a mut Context,
+	heap_pages: u32,
+	ext: &'a mut E,
+	version: Option<RuntimeVersion>,
+}
+
+impl<'a, E> WasmRuntime<E> for WasmJITRuntime<'a, E>
+	where E: Externalities<Blake2Hasher>
+{
+	fn version(&self) -> Option<RuntimeVersion> {
+		self.version.clone()
+	}
+
+	fn call(&mut self, method: &str, data: &[u8]) -> Result<Vec<u8>, Error> {
+		WasmtimeExecutor::call(self.ext, self.module, self.context, method, data, self.heap_pages)
+	}
+
+	fn ext(&mut self) -> &mut E {
+		self.ext
+	}
 }
