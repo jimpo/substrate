@@ -1527,7 +1527,6 @@ impl WasmExecutor {
 	}
 }
 
-
 #[cfg(test)]
 mod tests {
 	use super::*;

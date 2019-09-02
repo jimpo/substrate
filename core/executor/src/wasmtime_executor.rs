@@ -6,7 +6,7 @@ use codec::Decode;
 use cranelift_codegen::{settings, ir, ir::types, isa};
 use cranelift_entity::PrimaryMap;
 use cranelift_wasm::DefinedFuncIndex;
-use primitives::{Blake2Hasher, storage::well_known_keys};
+use primitives::{Blake2Hasher, H256, storage::well_known_keys};
 use state_machine::Externalities;
 use std::cell::RefCell;
 use std::collections::{HashMap, hash_map::Entry};
@@ -24,23 +24,19 @@ pub struct WasmtimeExecutor;
 
 const DEFAULT_HEAP_PAGES: u32 = 1024;
 
-thread_local! {
-	static MODULE_CACHE: RefCell<ModuleCache> = RefCell::new(ModuleCache::new());
-}
-
 impl WasmtimeExecutor {
-	pub fn call_with_code_in_storage<E: Externalities<Blake2Hasher>>(
-		ext: &mut E,
-		method: &str,
-		data: &[u8],
-		default_heap_pages: Option<u32>,
-	) -> Result<Vec<u8>> {
-		MODULE_CACHE.with(|cache| {
-			let mut cache = cache.borrow_mut();
-			let (module, context) = cache.fetch_runtime(ext)?;
-			Self::call(ext, module, context, method, data, default_heap_pages)
-		})
-	}
+//	pub fn call_with_code_in_storage<E: Externalities<Blake2Hasher>>(
+//		ext: &mut E,
+//		method: &str,
+//		data: &[u8],
+//		default_heap_pages: Option<u32>,
+//	) -> Result<Vec<u8>> {
+//		MODULE_CACHE.with(|cache| {
+//			let mut cache = cache.borrow_mut();
+//			let (module, context) = cache.fetch_runtime(ext)?;
+//			Self::call(ext, module, context, method, data, default_heap_pages)
+//		})
+//	}
 
 	/// Call a given method in the given code.
 	///
@@ -51,14 +47,8 @@ impl WasmtimeExecutor {
 		context: &mut Context,
 		method: &str,
 		data: &[u8],
-		default_heap_pages: Option<u32>,
+		heap_pages: u32,
 	) -> Result<Vec<u8>> {
-		let heap_pages = ext
-			.storage(well_known_keys::HEAP_PAGES)
-			.and_then(|pages| u32::decode(&mut &pages[..]).ok())
-			.or(default_heap_pages)
-			.unwrap_or(DEFAULT_HEAP_PAGES);
-
 		// Old exports get clobbered if we don't explicitly remove them first.
 		// TODO: open an issue on wasmtime and reference it here
 		{
@@ -1472,44 +1462,8 @@ fn get_heap_base(instance: &mut InstanceHandle) -> Result<u32> {
 	}
 }
 
-pub struct ModuleCache {
-	/// A cache of runtime instances along with metadata, ready to be reused.
-	///
-	/// Instances are keyed by the hash of their code.
-	instances: HashMap<[u8; 32], std::result::Result<(CompiledModule, Context), Arc<SetupError>>>,
-}
-
-impl ModuleCache {
-	/// Creates a new instance of a runtimes cache.
-	pub fn new() -> ModuleCache {
-		ModuleCache {
-			instances: HashMap::new(),
-		}
-	}
-
-	pub fn fetch_runtime(&mut self, ext: &mut dyn Externalities<Blake2Hasher>)
-		-> Result<&mut (CompiledModule, Context)>
-	{
-		let code_hash = ext
-			.original_storage_hash(well_known_keys::CODE)
-			.ok_or(Error::InvalidCode("`CODE` not found in storage.".into()))?;
-
-		// TODO: Limit memory consumption somehow by HEAP_PAGES?
-
-		let value = match self.instances.entry(code_hash.into()) {
-			Entry::Occupied(mut e) => e.into_mut(),
-			Entry::Vacant(e) => {
-				let code = ext
-					.original_storage(well_known_keys::CODE)
-					.ok_or(Error::InvalidCode("`CODE` not found in storage.".into()))?;
-				e.insert(create_compiled_unit(&code).map_err(|e| Arc::new(e)))
-			}
-		};
-		value.as_mut().map_err(|e| Error::WasmtimeSetup(e.clone()))
-	}
-}
-
-fn create_compiled_unit(code: &[u8]) -> std::result::Result<(CompiledModule, Context), SetupError>
+pub fn create_compiled_unit(code: &[u8])
+	-> std::result::Result<(CompiledModule, Context), SetupError>
 {
 	let isa_builder = cranelift_native::builder().unwrap_or_else(|reason| {
 		panic!("host machine is not a supported target: {}", reason);
@@ -1532,4 +1486,3 @@ fn create_compiled_unit(code: &[u8]) -> std::result::Result<(CompiledModule, Con
 	let module = context.compile(&code)?;
 	Ok((module, context))
 }
-
