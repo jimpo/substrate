@@ -80,7 +80,7 @@ impl<D: NativeExecutionDispatch> NativeExecutor<D> {
 			_dummy: Default::default(),
 			native_version: D::native_version(),
 			default_heap_pages,
-			use_jit: false,
+			use_jit: true,
 		}
 	}
 

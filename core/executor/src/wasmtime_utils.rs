@@ -1,6 +1,9 @@
-use crate::wasm_env::EnvContext;
+use crate::error::Error;
+use crate::wasm_env::{EnvContext, StateMachineContext};
 
 use cranelift_codegen::ir::types::{Type, I32, I64};
+use nix::sys::signal;
+use wasmtime_runtime::VMContext;
 
 pub trait AbiRet {
 	type Abi;
@@ -106,10 +109,19 @@ macro_rules! def_syscalls {
                 vmctx: *mut VMContext,
                 $($arg: <$ty as AbiParam>::Abi,)*
             ) -> <$ret as AbiRet>::Abi {
-            	let $ctx = EnvContext::new(vmctx)
-            		.expect("must be able to construct EnvContext from valid *mut VMContext");
-                let r = super::$name($ctx, $(<$ty as AbiParam>::convert($arg),)*).unwrap();
-                <$ret as AbiRet>::convert(r)
+            	let panic_result = std::panic::catch_unwind(move || {
+            		let $ctx = EnvContext::new(vmctx)
+            			.expect("must be able to construct EnvContext from valid *mut VMContext");
+                	let r = match super::$name($ctx, $(<$ty as AbiParam>::convert($arg),)*) {
+						Ok(r) => r,
+						Err(e) => crate::wasmtime_utils::trap(vmctx, e),
+                	};
+                	<$ret as AbiRet>::convert(r)
+                });
+                match panic_result {
+                	Ok(result) => result,
+                	Err(_) => crate::wasmtime_utils::trap(vmctx, Error::Other("panic in external function")),
+                }
             }
         }
 
@@ -119,3 +131,12 @@ macro_rules! def_syscalls {
     )*)
 }
 // Maybe don't need  the extern "C" on the outer func?
+
+pub(crate) unsafe fn trap(vmctx: *mut VMContext, err: Error) -> ! {
+	if let Some(Some(ref mut state)) = (*vmctx).host_state().downcast_mut::<Option<StateMachineContext>>() {
+		state.error = Some(err);
+	}
+	// TODO: Log on error
+	let _ = signal::raise(signal::SIGILL);
+	unreachable!();
+}

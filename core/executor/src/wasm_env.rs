@@ -14,12 +14,14 @@ pub type Wasm32Size = u32;
 
 pub struct StateMachineContext {
 	pub ext: &'static mut dyn Externalities<Blake2Hasher>,
+	pub error: Option<Error>,
 	pub allocator: OtherAllocator,
 	pub hash_lookup: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 pub struct EnvContext<'a> {
 	pub ext: &'a mut dyn Externalities<Blake2Hasher>,
+	pub error: &'a mut Option<Error>,
 	pub memory: EnvMemory<'a>,
 	pub formatter: EnvFormatter<'a>,
 }
@@ -62,6 +64,7 @@ impl<'a> EnvContext<'a> {
 		};
 		Ok(EnvContext {
 			ext: state.ext,
+			error: &mut state.error,
 			memory,
 			formatter,
 		})

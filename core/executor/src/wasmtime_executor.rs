@@ -74,6 +74,8 @@ impl WasmtimeExecutor {
 		let outcome = context
 			.invoke(&mut instance, method, &args[..])
 			.map_err(Error::WasmtimeAction)?;
+		let final_state = clear_host_state(context)?;
+		// TODO: assert that final_state is Some.
 		let (output_offset, output_len) = match outcome {
 			ActionOutcome::Returned { values } => {
 				if values.len()	!= 1 {
@@ -85,11 +87,13 @@ impl WasmtimeExecutor {
 					return Err(Error::InvalidReturn);
 				}
 			}
-			ActionOutcome::Trapped { message } =>
-				return Err(Error::WasmtimeTrap(message)),
+			ActionOutcome::Trapped { message } => {
+				let err = final_state
+					.and_then(|state| state.error)
+					.unwrap_or_else(|| Error::WasmtimeTrap(message));
+				return Err(err);
+			}
 		};
-
-		clear_host_state(context)?;
 
 		let memory = get_memory(&mut instance);
 		let output = &memory[(output_offset as usize)..((output_offset + output_len) as usize)];
@@ -116,28 +120,27 @@ unsafe fn grow_memory(instance: &mut InstanceHandle, pages: u32) -> Result<()> {
 	Ok(())
 }
 
+fn get_host_state(context: &mut Context) -> Option<&mut Option<StateMachineContext>> {
+	let env_instance = context.get_instance("env").ok()?;
+	env_instance.host_state().downcast_mut::<Option<StateMachineContext>>()
+}
+
 unsafe fn reset_host_state(context: &mut Context, ext: &mut dyn Externalities<Blake2Hasher>)
 	-> Result<()>
 {
-	let env_instance = context.get_instance("env")
-		.expect("context has instance with name \"env\"");
-	let mut state = env_instance.host_state().downcast_mut::<Option<StateMachineContext>>()
-		.expect("host_state of env instance is a StateMachineContext");
+	let state = get_host_state(context).ok_or_else(|| Error::InvalidWasmContext)?;
 	*state = Some(StateMachineContext {
 		ext: mem::transmute::<_, &'static mut dyn Externalities<Blake2Hasher>>(ext),
+		error: None,
 		allocator: OtherAllocator::new(),
 		hash_lookup: HashMap::new(),
 	});
 	Ok(())
 }
 
-fn clear_host_state(context: &mut Context) -> Result<()> {
-	let env_instance = context.get_instance("env")
-		.map_err(|_| Error::InvalidWasmContext)?;
-	let state = env_instance.host_state().downcast_mut::<Option<StateMachineContext>>()
-		.ok_or_else(|| Error::InvalidWasmContext)?;
-	*state = None;
-	Ok(())
+fn clear_host_state(context: &mut Context) -> Result<Option<StateMachineContext>> {
+	let state = get_host_state(context).ok_or_else(|| Error::InvalidWasmContext)?;
+	Ok(mem::replace(state, None))
 }
 
 fn inject_input_data(
@@ -929,6 +932,8 @@ mod syscalls {
 			sig_data: Wasm32Ptr,
 			pubkey_data: Wasm32Ptr,
 		) -> Result<u32> {
+			return Err(Error::Other("oh noes"));
+
 			let mut sig = [0u8; 64];
 			this.memory.read_into(sig_data, &mut sig[..])
 				.map_err(|_| "Invalid attempt to get signature in ext_sr25519_verify")?;

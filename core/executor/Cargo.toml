@@ -33,6 +33,7 @@ wasmtime-environ = { git = "https://github.com/jimpo/wasmtime", branch = "contex
 wasmtime-jit = { git = "https://github.com/jimpo/wasmtime", branch = "context-compile" }
 wasmtime-runtime = { git = "https://github.com/jimpo/wasmtime", branch = "context-compile" }
 target-lexicon = "0.4"
+nix = "0.15"
 
 [dev-dependencies]
 assert_matches = "1.1"
