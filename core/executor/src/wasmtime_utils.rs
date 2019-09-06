@@ -114,13 +114,15 @@ macro_rules! def_syscalls {
             			.expect("must be able to construct EnvContext from valid *mut VMContext");
                 	let r = match super::$name($ctx, $(<$ty as AbiParam>::convert($arg),)*) {
 						Ok(r) => r,
-						Err(e) => crate::wasmtime_utils::trap(vmctx, e),
+						Err(e) => crate::wasmtime_utils::trap_with_error(vmctx, e),
                 	};
                 	<$ret as AbiRet>::convert(r)
                 });
                 match panic_result {
                 	Ok(result) => result,
-                	Err(_) => crate::wasmtime_utils::trap(vmctx, Error::Other("panic in external function")),
+                	Err(_) => crate::wasmtime_utils::trap_with_error(
+						vmctx, Error::Other("panic in external function")
+					),
                 }
             }
         }
@@ -132,10 +134,15 @@ macro_rules! def_syscalls {
 }
 // Maybe don't need  the extern "C" on the outer func?
 
-pub(crate) unsafe fn trap(vmctx: *mut VMContext, err: Error) -> ! {
-	if let Some(Some(ref mut state)) = (*vmctx).host_state().downcast_mut::<Option<StateMachineContext>>() {
+pub(crate) unsafe fn trap_with_error(vmctx: *mut VMContext, err: Error) -> ! {
+	let maybe_state= (*vmctx).host_state().downcast_mut::<Option<StateMachineContext>>();
+	if let Some(Some(ref mut state)) = maybe_state {
 		state.error = Some(err);
 	}
+	trap(vmctx)
+}
+
+pub(crate) unsafe fn trap(vmctx: *mut VMContext) -> ! {
 	// TODO: Log on error
 	let _ = signal::raise(signal::SIGILL);
 	unreachable!();

@@ -1,5 +1,6 @@
 use crate::allocator::OtherAllocator;
 use crate::error::{Error, Result};
+use crate::sandbox;
 
 use byteorder::{ByteOrder, LittleEndian};
 use primitives::{Blake2Hasher, hexdisplay::HexDisplay};
@@ -7,7 +8,7 @@ use state_machine::Externalities;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::mem::size_of;
-use wasmtime_runtime::{Export, VMContext, InstanceHandle};
+use wasmtime_runtime::{Export, VMContext, InstanceHandle, VMCallerCheckedAnyfunc};
 
 pub type Wasm32Ptr = u32;
 pub type Wasm32Size = u32;
@@ -17,6 +18,7 @@ pub struct StateMachineContext {
 	pub error: Option<Error>,
 	pub allocator: OtherAllocator,
 	pub hash_lookup: HashMap<Vec<u8>, Vec<u8>>,
+	pub sandbox_store: sandbox::Store,
 }
 
 pub struct EnvContext<'a> {
@@ -24,6 +26,8 @@ pub struct EnvContext<'a> {
 	pub error: &'a mut Option<Error>,
 	pub memory: EnvMemory<'a>,
 	pub formatter: EnvFormatter<'a>,
+	pub indirect_table: &'a [VMCallerCheckedAnyFunc],
+	pub sandbox_store: &'a mut sandbox::Store,
 }
 
 pub struct EnvMemory<'a> {
@@ -54,6 +58,14 @@ impl<'a> EnvContext<'a> {
 				*(*definition).as_u32(),
 			_ => return Err(Error::HeapBaseNotFoundOrInvalid),
 		};
+		let indirect_table = match (*vmctx).lookup_global_export("__indirect_function_table") {
+			Some(Export::Table { definition, vmctx: _, table: _ }) =>
+				std::slice::from_raw_parts(
+					(*definition).base as *const VMCallerCheckedAnyfunc,
+					(*definition).current_elements,
+				),
+			_ => return Err(Error::IndirectTableNotFoundOrInvalid),
+		};
 		let memory = EnvMemory {
 			mem,
 			allocator: &mut state.allocator,
@@ -67,6 +79,8 @@ impl<'a> EnvContext<'a> {
 			error: &mut state.error,
 			memory,
 			formatter,
+			indirect_table,
+			sandbox_store: &mut state.sandbox_store,
 		})
 	}
 

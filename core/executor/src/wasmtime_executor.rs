@@ -297,6 +297,7 @@ mod syscalls {
 	use state_machine::ChildStorageKey;
 	use std::convert::{TryFrom, TryInto};
 	use trie::{TrieConfiguration, trie_types::Layout};
+	use wasmi::MemoryInstance;
 	use wasmtime_runtime::{Export, VMContext};
 
 	#[cfg(feature="wasm-extern-trace")]
@@ -932,8 +933,6 @@ mod syscalls {
 			sig_data: Wasm32Ptr,
 			pubkey_data: Wasm32Ptr,
 		) -> Result<u32> {
-			return Err(Error::Other("oh noes"));
-
 			let mut sig = [0u8; 64];
 			this.memory.read_into(sig_data, &mut sig[..])
 				.map_err(|_| "Invalid attempt to get signature in ext_sr25519_verify")?;
@@ -1378,19 +1377,36 @@ mod syscalls {
 		}
 
 		ext_sandbox_instantiate(
-			&_this,
-			_dispatch_thunk_idx: u32,
-			_wasm_ptr: Wasm32Ptr,
-			_wasm_len: Wasm32Size,
-			_imports_ptr: Wasm32Ptr,
-			_imports_len: Wasm32Size,
-			_state: u32,
+			&this,
+			dispatch_thunk_idx: u32,
+			wasm_ptr: Wasm32Ptr,
+			wasm_len: Wasm32Size,
+			imports_ptr: Wasm32Ptr,
+			imports_len: Wasm32Size,
+			state: u32,
 		) -> Result<u32> {
-			Err("Unimplemented".into())
+			let wasm = this.memory.read(utf8_data, utf8_len)
+				.map_err(|_| "OOB while ext_sandbox_instantiate: wasm")?;
+			let raw_env_def = this.memory.read(imports_ptr, imports_len)
+				.map_err(|_| "OOB while ext_sandbox_instantiate: imports")?;
+
+			// Extract a dispatch thunk from instance's table by the specified index.
+			let dispatch_thunk = this.indirect_table.get(dispatch_thunk_idx)
+				.ok_or_else(|| "dispatch_thunk_idx is out of the table bounds")?;
+
+			let instance_idx_or_err_code =
+				match sandbox::instantiate(this, dispatch_thunk, &wasm, &raw_env_def, state) {
+					Ok(instance_idx) => instance_idx,
+					Err(sandbox::InstantiationError::StartTrapped) => sandbox_primitives::ERR_EXECUTION,
+					Err(_) => sandbox_primitives::ERR_MODULE,
+				};
+
+			Ok(instance_idx_or_err_code as u32)
 		}
 
 		ext_sandbox_instance_teardown(&_this, _instance_idx: u32) -> Result<()> {
-			Err("Unimplemented".into())
+			this.sandbox_store.instance_teardown(instance_idx)?;
+			Ok(())
 		}
 
 		ext_sandbox_invoke(
@@ -1407,32 +1423,49 @@ mod syscalls {
 			Err("Unimplemented".into())
 		}
 
-		ext_sandbox_memory_new(&_this, _initial: u32, _maximum: u32) -> Result<u32> {
-			Err("Unimplemented".into())
+		ext_sandbox_memory_new(&this, initial: u32, maximum: u32) -> Result<u32> {
+			let mem_idx = this.sandbox_store.new_memory(initial, maximum)?;
+			Ok(mem_idx)
 		}
 
 		ext_sandbox_memory_get(
-			&_this,
-			_memory_idx: u32,
-			_offset: u32,
-			_buf_ptr: Wasm32Ptr,
-			_buf_len: Wasm32Size,
+			&this,
+			memory_idx: u32,
+			offset: u32,
+			buf_ptr: Wasm32Ptr,
+			buf_len: Wasm32Size,
 		) -> Result<u32> {
-			Err("Unimplemented".into())
+			let sandboxed_memory = this.sandbox_store.memory(memory_idx)?;
+			sandbox_memory.with_direct_access(|memory| {
+				let start = offset as usize;
+				let end = match offset.checked_add(buf_len) {
+					Some(end) if end as usize <= memory.len() => end as usize,
+					_ => return Ok(sandbox_primitives::ERR_OUT_OF_BOUNDS),
+				};
+				this.memory.write(buf_ptr, &memory[start..end])?;
+				Ok(sandbox_primitives::ERR_OK)
+			});
 		}
 
 		ext_sandbox_memory_set(
-			&_this,
-			_memory_idx: u32,
-			_offset: u32,
-			_val_ptr: Wasm32Ptr,
-			_val_len: Wasm32Size,
+			&this,
+			memory_idx: u32,
+			offset: u32,
+			val_ptr: Wasm32Ptr,
+			val_len: Wasm32Size,
 		) -> Result<u32> {
-			Err("Unimplemented".into())
+			let val = this.memory.read(val_ptr, val_len)?;
+
+			let sandboxed_memory = this.sandbox_store.memory(memory_idx)?;
+			match sandbox_memory.set(offset, val) {
+				Ok(()) => Ok(sandbox_primitives::ERR_OK),
+				Err(_) => Ok(sandbox_primitives::ERR_OUT_OF_BOUNDS),
+			}
 		}
 
 		ext_sandbox_memory_teardown(&_this, _memory_idx: u32) -> Result<()> {
-			Err("Unimplemented".into())
+			this.sandbox_store.memory_teardown(memory_idx)?;
+			Ok(())
 		}
 	}
 

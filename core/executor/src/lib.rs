@@ -31,6 +31,7 @@
 // mod compiled_wasm_executor;
 mod wasm_env;
 mod wasmtime_executor;
+mod wasmtime_sandbox;
 mod wasmtime_utils;
 #[macro_use]
 mod wasm_utils;

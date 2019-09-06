@@ -64,6 +64,8 @@ pub enum Error {
 	/// allocator is allowed to place its data.
 	#[display(fmt="The runtime doesn't provide a global named `__heap_base`")]
 	HeapBaseNotFoundOrInvalid,
+	#[display(fmt="The runtime doesn't provide a table named `__indirect_function_table`")]
+	IndirectTableNotFoundOrInvalid,
 	/// The runtime WebAssembly module is not allowed to have the `start` function.
 	#[display(fmt="The runtime has the `start` function")]
 	RuntimeHasStartFn,
