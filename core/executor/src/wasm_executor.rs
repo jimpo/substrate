@@ -20,10 +20,7 @@ use std::{collections::HashMap, convert::TryFrom, str};
 use tiny_keccak;
 use secp256k1;
 
-use wasmi::{
-	Module, ModuleInstance, MemoryInstance, MemoryRef, TableRef, ImportsBuilder, ModuleRef,
-	memory_units::Pages, RuntimeValue::{I32, I64, self},
-};
+use wasmi::{Module, ModuleInstance, MemoryInstance, MemoryRef, TableRef, ImportsBuilder, ModuleRef, memory_units::Pages, RuntimeValue::{I32, I64, self}, FuncInstance, FuncRef};
 use state_machine::{Externalities, ChildStorageKey};
 use crate::error::{Error, Result};
 use codec::Encode;
@@ -35,6 +32,8 @@ use trie::{TrieConfiguration, trie_types::Layout};
 use crate::sandbox;
 use crate::allocator;
 use log::trace;
+use crate::wasm_env::{Wasm32Size, Wasm32Ptr};
+use crate::wasmtime_utils::trap;
 
 #[cfg(feature="wasm-extern-trace")]
 macro_rules! debug_trace {
@@ -46,7 +45,7 @@ macro_rules! debug_trace {
 }
 
 struct FunctionExecutor<'e, E: Externalities<Blake2Hasher> + 'e> {
-	sandbox_store: sandbox::Store,
+	sandbox_store: sandbox::Store<FuncRef>,
 	heap: allocator::FreeingBumpHeapAllocator<MemoryRef>,
 	memory: MemoryRef,
 	table: Option<TableRef>,
@@ -68,10 +67,12 @@ impl<'e, E: Externalities<Blake2Hasher>> FunctionExecutor<'e, E> {
 }
 
 impl<'e, E: Externalities<Blake2Hasher>> sandbox::SandboxCapabilities for FunctionExecutor<'e, E> {
-	fn store(&self) -> &sandbox::Store {
+	type FunctionRef = FuncRef;
+
+	fn store(&self) -> &sandbox::Store<Self::FunctionRef> {
 		&self.sandbox_store
 	}
-	fn store_mut(&mut self) -> &mut sandbox::Store {
+	fn store_mut(&mut self) -> &mut sandbox::Store<Self::FunctionRef> {
 		&mut self.sandbox_store
 	}
 	fn allocate(&mut self, len: u32) -> Result<u32> {
@@ -85,6 +86,31 @@ impl<'e, E: Externalities<Blake2Hasher>> sandbox::SandboxCapabilities for Functi
 	}
 	fn read_memory(&self, ptr: u32, len: u32) -> Result<Vec<u8>> {
 		self.memory.get(ptr, len as usize).map_err(Into::into)
+	}
+	fn invoke(
+		&mut self,
+		dispatch_thunk: Self::FunctionRef,
+		invoke_args_ptr: Wasm32Ptr,
+		invoke_args_len: Wasm32Size,
+		state: Wasm32Ptr,
+		func_idx: usize,
+	) -> Result<i64>
+	{
+		let result = FuncInstance::invoke(
+			&dispatch_thunk,
+			&[
+				RuntimeValue::I32(invoke_args_ptr as i32),
+				RuntimeValue::I32(invoke_args_len as i32),
+				RuntimeValue::I32(state as i32),
+				RuntimeValue::I32(func_idx as i32),
+			],
+			self
+		);
+		match result {
+			Ok(Some(RuntimeValue::I64(v))) => Ok(v),
+			Ok(_) => return Err(Error::Other("Supervisor function returned unexpected result!")),
+			Err(err) => return Err(Error::Trap(err)),
+		}
 	}
 }
 

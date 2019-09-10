@@ -18,7 +18,7 @@
 
 use crate::error::Result;
 
-use primitives::{Blake2Hasher, H256};
+use primitives::Blake2Hasher;
 use runtime_version::RuntimeVersion;
 use state_machine::Externalities;
 use wasmi::{ValueType, RuntimeValue};

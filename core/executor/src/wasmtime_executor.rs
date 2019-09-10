@@ -1,5 +1,6 @@
 use crate::allocator::OtherAllocator;
 use crate::error::{Error, Result};
+use crate::sandbox;
 use crate::wasm_env::{StateMachineContext, Wasm32Ptr, Wasm32Size};
 
 use codec::Decode;
@@ -15,7 +16,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use target_lexicon::HOST;
 use wasmtime_environ::{translate_signature, Module, WASM_PAGE_SIZE};
-use wasmtime_jit::{ActionOutcome, CompiledModule, Context, Features, RuntimeValue, SetupError};
+use wasmtime_jit::{ActionOutcome, CompiledModule, Context, Features, RuntimeValue, SetupError, Compiler};
 use wasmtime_runtime::{
 	Export, Imports, InstanceHandle, VMContext, VMFunctionBody,
 };
@@ -56,6 +57,7 @@ impl WasmtimeExecutor {
 			let mut global_exports = global_exports.borrow_mut();
 			global_exports.remove("memory");
 			global_exports.remove("__heap_base");
+			global_exports.remove("__indirect_function_table");
 		}
 
 		let mut instance = module.instantiate()
@@ -128,12 +130,18 @@ fn get_host_state(context: &mut Context) -> Option<&mut Option<StateMachineConte
 unsafe fn reset_host_state(context: &mut Context, ext: &mut dyn Externalities<Blake2Hasher>)
 	-> Result<()>
 {
-	let state = get_host_state(context).ok_or_else(|| Error::InvalidWasmContext)?;
+	let mut env_instance = context.get_instance("env")
+		.map_err(|_| Error::InvalidWasmContext)?
+		.clone();
+	let state = env_instance.host_state().downcast_mut::<Option<StateMachineContext>>()
+		.ok_or_else(|| Error::InvalidWasmContext)?;
 	*state = Some(StateMachineContext {
 		ext: mem::transmute::<_, &'static mut dyn Externalities<Blake2Hasher>>(ext),
 		error: None,
 		allocator: OtherAllocator::new(),
 		hash_lookup: HashMap::new(),
+		sandbox_store: sandbox::Store::new(),
+		compiler: mem::transmute::<_, &'static mut Compiler>(context.compiler()),
 	});
 	Ok(())
 }
@@ -284,6 +292,7 @@ mod syscalls {
 	use super::StateMachineContext;
 	use crate::def_syscalls;
 	use crate::error::{Error, Result};
+	use crate::sandbox;
 	use crate::wasm_env::{EnvContext, Wasm32Ptr, Wasm32Size};
 	use crate::wasmtime_utils::{AbiParam, AbiRet};
 
@@ -1385,17 +1394,19 @@ mod syscalls {
 			imports_len: Wasm32Size,
 			state: u32,
 		) -> Result<u32> {
-			let wasm = this.memory.read(utf8_data, utf8_len)
-				.map_err(|_| "OOB while ext_sandbox_instantiate: wasm")?;
+			let wasm = this.memory.read(wasm_ptr, wasm_len)
+				.map_err(|_| "OOB while ext_sandbox_instantiate: wasm")?
+				.to_vec();
 			let raw_env_def = this.memory.read(imports_ptr, imports_len)
-				.map_err(|_| "OOB while ext_sandbox_instantiate: imports")?;
+				.map_err(|_| "OOB while ext_sandbox_instantiate: imports")?
+				.to_vec();
 
 			// Extract a dispatch thunk from instance's table by the specified index.
-			let dispatch_thunk = this.indirect_table.get(dispatch_thunk_idx)
+			let dispatch_thunk = this.indirect_table.get(dispatch_thunk_idx as usize)
 				.ok_or_else(|| "dispatch_thunk_idx is out of the table bounds")?;
 
 			let instance_idx_or_err_code =
-				match sandbox::instantiate(this, dispatch_thunk, &wasm, &raw_env_def, state) {
+				match sandbox::instantiate(&mut this, dispatch_thunk, &wasm, &raw_env_def, state) {
 					Ok(instance_idx) => instance_idx,
 					Err(sandbox::InstantiationError::StartTrapped) => sandbox_primitives::ERR_EXECUTION,
 					Err(_) => sandbox_primitives::ERR_MODULE,
@@ -1404,23 +1415,62 @@ mod syscalls {
 			Ok(instance_idx_or_err_code as u32)
 		}
 
-		ext_sandbox_instance_teardown(&_this, _instance_idx: u32) -> Result<()> {
+		ext_sandbox_instance_teardown(&this, instance_idx: u32) -> Result<()> {
 			this.sandbox_store.instance_teardown(instance_idx)?;
 			Ok(())
 		}
 
 		ext_sandbox_invoke(
-			&_this,
-			_instance_idx: u32,
-			_export_ptr: Wasm32Ptr,
-			_export_len: Wasm32Size,
-			_args_ptr: Wasm32Ptr,
-			_args_len: Wasm32Size,
-			_return_val_ptr: Wasm32Ptr,
-			_return_val_len: Wasm32Size,
-			_state: u32,
+			&this,
+			instance_idx: u32,
+			export_ptr: Wasm32Ptr,
+			export_len: Wasm32Size,
+			args_ptr: Wasm32Ptr,
+			args_len: Wasm32Size,
+			return_val_ptr: Wasm32Ptr,
+			return_val_len: Wasm32Size,
+			state: u32,
 		) -> Result<u32> {
-			Err("Unimplemented".into())
+			use codec::{Decode, Encode};
+
+			trace!(target: "sr-sandbox", "invoke, instance_idx={}", instance_idx);
+			let export = this.memory.read(export_ptr, export_len)
+				.map_err(|_| "OOB while ext_sandbox_invoke: export")
+				.and_then(|b|
+					String::from_utf8(b.to_vec())
+						.map_err(|_| "Export name should be a valid utf-8 sequence")
+				)?;
+
+			// Deserialize arguments and convert them into wasmi types.
+			let args = {
+				let mut serialized_args = this.memory.read(args_ptr, args_len)
+					.map_err(|_| "OOB while ext_sandbox_invoke: args")?;
+				Vec::<sandbox_primitives::TypedValue>::decode(&mut serialized_args)
+					.map_err(|_| "Can't decode serialized arguments for the invocation")?
+					.into_iter()
+					.map(Into::into)
+					.collect::<Vec<_>>()
+			};
+
+			let instance = this.sandbox_store.instance(instance_idx)?;
+			let result = instance.invoke(&export, &args, &mut this, state);
+
+			match result {
+				Ok(None) => Ok(sandbox_primitives::ERR_OK),
+				Ok(Some(val)) => {
+					// Serialize return value and write it back into the memory.
+					sandbox_primitives::ReturnValue::Value(val.into()).using_encoded(|val| {
+						if val.len() > return_val_len as usize {
+							Err("Return value buffer is too small")?;
+						}
+						this.memory
+							.write(return_val_ptr, val)
+							.map_err(|_| "Return value buffer is OOB")?;
+						Ok(sandbox_primitives::ERR_OK)
+					})
+				}
+				Err(_) => Ok(sandbox_primitives::ERR_EXECUTION),
+			}
 		}
 
 		ext_sandbox_memory_new(&this, initial: u32, maximum: u32) -> Result<u32> {
@@ -1436,7 +1486,7 @@ mod syscalls {
 			buf_len: Wasm32Size,
 		) -> Result<u32> {
 			let sandboxed_memory = this.sandbox_store.memory(memory_idx)?;
-			sandbox_memory.with_direct_access(|memory| {
+			sandboxed_memory.with_direct_access(|memory| {
 				let start = offset as usize;
 				let end = match offset.checked_add(buf_len) {
 					Some(end) if end as usize <= memory.len() => end as usize,
@@ -1444,7 +1494,7 @@ mod syscalls {
 				};
 				this.memory.write(buf_ptr, &memory[start..end])?;
 				Ok(sandbox_primitives::ERR_OK)
-			});
+			})
 		}
 
 		ext_sandbox_memory_set(
@@ -1457,13 +1507,13 @@ mod syscalls {
 			let val = this.memory.read(val_ptr, val_len)?;
 
 			let sandboxed_memory = this.sandbox_store.memory(memory_idx)?;
-			match sandbox_memory.set(offset, val) {
+			match sandboxed_memory.set(offset, val) {
 				Ok(()) => Ok(sandbox_primitives::ERR_OK),
 				Err(_) => Ok(sandbox_primitives::ERR_OUT_OF_BOUNDS),
 			}
 		}
 
-		ext_sandbox_memory_teardown(&_this, _memory_idx: u32) -> Result<()> {
+		ext_sandbox_memory_teardown(&this, memory_idx: u32) -> Result<()> {
 			this.sandbox_store.memory_teardown(memory_idx)?;
 			Ok(())
 		}

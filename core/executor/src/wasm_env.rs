@@ -3,12 +3,23 @@ use crate::error::{Error, Result};
 use crate::sandbox;
 
 use byteorder::{ByteOrder, LittleEndian};
+use cranelift_codegen::{ir, ir::types};
 use primitives::{Blake2Hasher, hexdisplay::HexDisplay};
 use state_machine::Externalities;
 use std::borrow::Cow;
+use std::cmp;
 use std::collections::HashMap;
 use std::mem::size_of;
-use wasmtime_runtime::{Export, VMContext, InstanceHandle, VMCallerCheckedAnyfunc};
+use wasmtime_runtime::{
+	wasmtime_call_trampoline,
+	Export, VMContext, InstanceHandle, VMCallerCheckedAnyfunc, VMFunctionBody,
+};
+use wasmi::{RuntimeValue, ValueType};
+use wasmtime_jit::Compiler;
+use cranelift_codegen::isa::CallConv;
+use std::ptr;
+use std::sync::Arc;
+use cranelift_codegen::ir::ArgumentPurpose;
 
 pub type Wasm32Ptr = u32;
 pub type Wasm32Size = u32;
@@ -18,16 +29,19 @@ pub struct StateMachineContext {
 	pub error: Option<Error>,
 	pub allocator: OtherAllocator,
 	pub hash_lookup: HashMap<Vec<u8>, Vec<u8>>,
-	pub sandbox_store: sandbox::Store,
+	pub sandbox_store: sandbox::Store<*const VMCallerCheckedAnyfunc>,
+	pub compiler: &'static mut Compiler,
 }
 
 pub struct EnvContext<'a> {
+	pub vmctx: *mut VMContext,
 	pub ext: &'a mut dyn Externalities<Blake2Hasher>,
 	pub error: &'a mut Option<Error>,
 	pub memory: EnvMemory<'a>,
 	pub formatter: EnvFormatter<'a>,
-	pub indirect_table: &'a [VMCallerCheckedAnyFunc],
-	pub sandbox_store: &'a mut sandbox::Store,
+	pub indirect_table: &'a [VMCallerCheckedAnyfunc],
+	pub sandbox_store: &'a mut sandbox::Store<*const VMCallerCheckedAnyfunc>,
+	pub compiler: &'a mut Compiler,
 }
 
 pub struct EnvMemory<'a> {
@@ -75,12 +89,14 @@ impl<'a> EnvContext<'a> {
 			hash_lookup: &mut state.hash_lookup,
 		};
 		Ok(EnvContext {
+			vmctx,
 			ext: state.ext,
 			error: &mut state.error,
 			memory,
 			formatter,
 			indirect_table,
 			sandbox_store: &mut state.sandbox_store,
+			compiler: state.compiler,
 		})
 	}
 
@@ -183,4 +199,124 @@ impl<'a> EnvFormatter<'a> {
 	pub fn record_hash_preimage(&mut self, key: Vec<u8>, value: Vec<u8>) {
 		self.hash_lookup.insert(key, value);
 	}
+}
+
+impl<'a> sandbox::SandboxCapabilities for EnvContext<'a> {
+	type FunctionRef = *const VMCallerCheckedAnyfunc;
+
+	fn store(&self) -> &sandbox::Store<Self::FunctionRef> {
+		&self.sandbox_store
+	}
+
+	fn store_mut(&mut self) -> &mut sandbox::Store<Self::FunctionRef> {
+		&mut self.sandbox_store
+	}
+
+	fn allocate(&mut self, len: u32) -> Result<u32> {
+		self.memory.allocate(len as Wasm32Size)
+	}
+
+	fn deallocate(&mut self, ptr: u32) -> Result<()> {
+		self.memory.deallocate(ptr as Wasm32Ptr)
+	}
+
+	fn write_memory(&mut self, ptr: u32, data: &[u8]) -> Result<()> {
+		self.memory.write(ptr as Wasm32Ptr, data)
+	}
+
+	fn read_memory(&self, ptr: u32, len: u32) -> Result<Vec<u8>> {
+		self.memory.read(ptr as Wasm32Ptr, len as Wasm32Size)
+			.map(|data| data.to_vec())
+	}
+
+	fn invoke(
+		&mut self,
+		dispatch_thunk: Self::FunctionRef,
+		invoke_args_ptr: Wasm32Ptr,
+		invoke_args_len: Wasm32Size,
+		state: Wasm32Ptr,
+		func_idx: usize,
+	) -> Result<i64>
+	{
+		let value_size = size_of::<u64>();
+		let (signature, mut values_vec) = generate_signature_and_args(
+			&[
+				RuntimeValue::I32(invoke_args_ptr as i32),
+				RuntimeValue::I32(invoke_args_len as i32),
+				RuntimeValue::I32(state as i32),
+				RuntimeValue::I32(func_idx as i32),
+			],
+			&[ValueType::I64],
+			self.compiler.frontend_config().default_call_conv,
+		);
+
+		let func_ptr = unsafe { (*dispatch_thunk).func_ptr };
+		let vmctx = unsafe { (*dispatch_thunk).vmctx };
+
+		// Get the trampoline to call for this function.
+		let exec_code_buf = self.compiler
+			.get_published_trampoline(func_ptr, &signature, value_size)
+			.map_err(|e| Error::WasmtimeSetup(Arc::new(e)))?;
+
+		// Call the trampoline.
+		if let Err(message) = unsafe {
+			wasmtime_call_trampoline(
+				vmctx,
+				exec_code_buf,
+				values_vec.as_mut_ptr() as *mut u8,
+			)
+		} {
+			return Err(Error::WasmtimeTrap(message));
+		}
+
+		// Load the return value out of `values_vec`.
+		Ok(unsafe { ptr::read(values_vec.as_ptr() as *const i64) })
+	}
+}
+
+fn generate_signature_and_args(
+	args: &[RuntimeValue],
+	result_types: &[ValueType],
+	call_conv: CallConv,
+) -> (ir::Signature, Vec<u64>)
+{
+	let value_size = size_of::<u64>();
+	let mut values_vec: Vec<u64> = vec![0; cmp::max(args.len(), result_types.len())];
+	let mut signature = ir::Signature::new(call_conv);
+
+	// let pointer_type = isa.pointer_type();
+	signature.params.push(ir::AbiParam::special(types::I64, ArgumentPurpose::VMContext));
+
+	// Store the argument values into `values_vec`.
+	for (index, arg) in args.iter().enumerate() {
+		match arg {
+			RuntimeValue::I32(_) => signature.params.push(ir::AbiParam::new(types::I32)),
+			RuntimeValue::I64(_) => signature.params.push(ir::AbiParam::new(types::I64)),
+			RuntimeValue::F32(_) => signature.params.push(ir::AbiParam::new(types::F32)),
+			RuntimeValue::F64(_) => signature.params.push(ir::AbiParam::new(types::F64)),
+		}
+
+		unsafe {
+			let ptr = values_vec.as_mut_ptr().add(index);
+
+			match arg {
+				RuntimeValue::I32(x) => ptr::write(ptr as *mut i32, *x),
+				RuntimeValue::I64(x) => ptr::write(ptr as *mut i64, *x),
+				RuntimeValue::F32(x) => ptr::write(ptr as *mut u32, x.to_bits()),
+				RuntimeValue::F64(x) => ptr::write(ptr as *mut u64, x.to_bits()),
+			}
+		}
+	}
+
+	signature.returns = result_types.iter()
+		.map(|result_type| match result_type {
+			ValueType::I32 => types::I32,
+			ValueType::I64 => types::I64,
+			ValueType::F32 => types::F32,
+			ValueType::F64 => types::F64,
+		})
+		.map(ir::AbiParam::new)
+		.collect();
+
+	(signature, values_vec)
 }

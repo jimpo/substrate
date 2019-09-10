@@ -19,6 +19,7 @@
 //! This module implements sandboxing support in the runtime.
 
 use crate::error::{Result, Error};
+use crate::wasm_env::{Wasm32Ptr, Wasm32Size};
 use std::{collections::HashMap, rc::Rc};
 use codec::{Decode, Encode};
 use primitives::sandbox as sandbox_primitives;
@@ -26,7 +27,6 @@ use wasmi::{
 	Externals, FuncRef, ImportResolver, MemoryInstance, MemoryRef, Module, ModuleInstance,
 	ModuleRef, RuntimeArgs, RuntimeValue, Trap, TrapKind, memory_units::Pages,
 };
-use wasmtime_runtime::VMCallerCheckedAnyfunc;
 
 /// Index of a function inside the supervisor.
 ///
@@ -138,11 +138,13 @@ impl ImportResolver for Imports {
 ///
 /// Note that this functions are only called in the `supervisor` context.
 pub trait SandboxCapabilities {
+	type FunctionRef: Clone;
+
 	/// Returns a reference to an associated sandbox `Store`.
-	fn store(&self) -> &Store;
+	fn store(&self) -> &Store<Self::FunctionRef>;
 
 	/// Returns a mutable reference to an associated sandbox `Store`.
-	fn store_mut(&mut self) -> &mut Store;
+	fn store_mut(&mut self) -> &mut Store<Self::FunctionRef>;
 
 	/// Allocate space of the specified length in the supervisor memory.
 	///
@@ -175,15 +177,24 @@ pub trait SandboxCapabilities {
 	///
 	/// Returns `Err` if `ptr + len` is out of bounds.
 	fn read_memory(&self, ptr: u32, len: u32) -> Result<Vec<u8>>;
+
+	fn invoke(
+		&mut self,
+		dispatch_thunk: Self::FunctionRef,
+		invoke_args_ptr: Wasm32Ptr,
+		invoke_args_len: Wasm32Size,
+		state: Wasm32Ptr,
+		func_idx: usize,
+	) -> Result<i64>;
 }
 
 /// Implementation of [`Externals`] that allows execution of guest module with
 /// [externals][`Externals`] that might refer functions defined by supervisor.
 ///
 /// [`Externals`]: ../../wasmi/trait.Externals.html
-pub struct GuestExternals<'a, FE: SandboxCapabilities + Externals + 'a> {
+pub struct GuestExternals<'a, FE: SandboxCapabilities + 'a> {
 	supervisor_externals: &'a mut FE,
-	sandbox_instance: &'a SandboxInstance,
+	sandbox_instance: &'a SandboxInstance<FE::FunctionRef>,
 	state: u32,
 }
 
@@ -205,7 +216,7 @@ fn deserialize_result(serialized_result: &[u8]) -> std::result::Result<Option<Ru
 	}
 }
 
-impl<'a, FE: SandboxCapabilities + Externals + 'a> Externals for GuestExternals<'a, FE> {
+impl<'a, FE: SandboxCapabilities + 'a> Externals for GuestExternals<'a, FE> {
 	fn invoke_index(
 		&mut self,
 		index: usize,
@@ -241,30 +252,23 @@ impl<'a, FE: SandboxCapabilities + Externals + 'a> Externals for GuestExternals<
 			.allocate(invoke_args_data.len() as u32)?;
 		self.supervisor_externals
 			.write_memory(invoke_args_ptr, &invoke_args_data)?;
-		let result = ::wasmi::FuncInstance::invoke(
-			&dispatch_thunk,
-			&[
-				RuntimeValue::I32(invoke_args_ptr as i32),
-				RuntimeValue::I32(invoke_args_data.len() as i32),
-				RuntimeValue::I32(state as i32),
-				RuntimeValue::I32(func_idx.0 as i32),
-			],
-			self.supervisor_externals,
-		);
+		let result = self.supervisor_externals.invoke(
+			dispatch_thunk,
+			invoke_args_ptr,
+			invoke_args_data.len() as Wasm32Size,
+			state,
+			func_idx.0,
+		)?;
 		self.supervisor_externals.deallocate(invoke_args_ptr)?;
 
 		// dispatch_thunk returns pointer to serialized arguments.
-		let (serialized_result_val_ptr, serialized_result_val_len) = match result {
-			// Unpack pointer and len of the serialized result data.
-			Ok(Some(RuntimeValue::I64(v))) => {
-				// Cast to u64 to use zero-extension.
-				let v = v as u64;
-				let ptr = (v as u64 >> 32) as u32;
-				let len = (v & 0xFFFFFFFF) as u32;
-				(ptr, len)
-			}
-			Ok(_) => return Err(trap("Supervisor function returned unexpected result!")),
-			Err(_) => return Err(trap("Supervisor function trapped!")),
+		// Unpack pointer and len of the serialized result data.
+		let (serialized_result_val_ptr, serialized_result_val_len) = {
+			// Cast to u64 to use zero-extension.
+			let v = result as u64;
+			let ptr = (v as u64 >> 32) as u32;
+			let len = (v & 0xFFFFFFFF) as u32;
+			(ptr, len)
 		};
 
 		let serialized_result_val = self.supervisor_externals
@@ -281,12 +285,12 @@ impl<'a, FE: SandboxCapabilities + Externals + 'a> Externals for GuestExternals<
 
 fn with_guest_externals<FE, R, F>(
 	supervisor_externals: &mut FE,
-	sandbox_instance: &SandboxInstance,
+	sandbox_instance: &SandboxInstance<FE::FunctionRef>,
 	state: u32,
 	f: F,
 ) -> R
 where
-	FE: SandboxCapabilities + Externals,
+	FE: SandboxCapabilities,
 	F: FnOnce(&mut GuestExternals<FE>) -> R,
 {
 	let mut guest_externals = GuestExternals {
@@ -309,13 +313,13 @@ where
 /// code in the supervisor context.
 ///
 /// [`invoke`]: #method.invoke
-pub struct SandboxInstance {
+pub struct SandboxInstance<FR> {
 	instance: ModuleRef,
-	dispatch_thunk: FuncRef,
+	dispatch_thunk: FR,
 	guest_to_supervisor_mapping: GuestToSupervisorFunctionMapping,
 }
 
-impl SandboxInstance {
+impl<FR: Clone> SandboxInstance<FR> {
 	/// Invoke an exported function by a name.
 	///
 	/// `supervisor_externals` is required to execute the implementations
@@ -323,7 +327,7 @@ impl SandboxInstance {
 	///
 	/// The `state` parameter can be used to provide custom data for
 	/// these syscall implementations.
-	pub fn invoke<FE: SandboxCapabilities + Externals>(
+	pub fn invoke<FE: SandboxCapabilities<FunctionRef=FR>>(
 		&self,
 		export_name: &str,
 		args: &[RuntimeValue],
@@ -412,48 +416,9 @@ fn decode_environment_definition(
 /// - Module in `wasm` is invalid or couldn't be instantiated.
 ///
 /// [`EnvironmentDefinition`]: ../../sandbox/struct.EnvironmentDefinition.html
-pub fn instantiate<FE: SandboxCapabilities + Externals>(
+pub fn instantiate<FE: SandboxCapabilities>(
 	supervisor_externals: &mut FE,
-	dispatch_thunk: FuncRef,
-	wasm: &[u8],
-	raw_env_def: &[u8],
-	state: u32,
-) -> std::result::Result<u32, InstantiationError> {
-	let (imports, guest_to_supervisor_mapping) =
-		decode_environment_definition(raw_env_def, &supervisor_externals.store().memories)?;
-
-	let module = Module::from_buffer(wasm).map_err(|_| InstantiationError::ModuleDecoding)?;
-	let instance = ModuleInstance::new(&module, &imports).map_err(|_| InstantiationError::Instantiation)?;
-
-	let sandbox_instance = Rc::new(SandboxInstance {
-		// In general, it's not a very good idea to use `.not_started_instance()` for anything
-		// but for extracting memory and tables. But in this particular case, we are extracting
-		// for the purpose of running `start` function which should be ok.
-		instance: instance.not_started_instance().clone(),
-		dispatch_thunk,
-		guest_to_supervisor_mapping,
-	});
-
-	with_guest_externals(
-		supervisor_externals,
-		&sandbox_instance,
-		state,
-		|guest_externals| {
-			instance
-				.run_start(guest_externals)
-				.map_err(|_| InstantiationError::StartTrapped)
-		},
-	)?;
-
-	// At last, register the instance.
-	let instance_idx = supervisor_externals
-		.store_mut()
-		.register_sandbox_instance(sandbox_instance);
-	Ok(instance_idx)
-}
-
-pub fn instantiate_with_compiled_runtime(
-	dispatch_thunk: VMCallerCheckedAnyfunc,
+	dispatch_thunk: FE::FunctionRef,
 	wasm: &[u8],
 	raw_env_def: &[u8],
 	state: u32,
@@ -492,15 +457,15 @@ pub fn instantiate_with_compiled_runtime(
 }
 
 /// This struct keeps track of all sandboxed components.
-pub struct Store {
+pub struct Store<FR> {
 	// Memories and instances are `Some` untill torndown.
-	instances: Vec<Option<Rc<SandboxInstance>>>,
+	instances: Vec<Option<Rc<SandboxInstance<FR>>>>,
 	memories: Vec<Option<MemoryRef>>,
 }
 
-impl Store {
+impl<FR> Store<FR> {
 	/// Create a new empty sandbox store.
-	pub fn new() -> Store {
+	pub fn new() -> Self {
 		Store {
 			instances: Vec::new(),
 			memories: Vec::new(),
@@ -536,7 +501,7 @@ impl Store {
 	///
 	/// Returns `Err` If `instance_idx` isn't a valid index of an instance or
 	/// instance is already torndown.
-	pub fn instance(&self, instance_idx: u32) -> Result<Rc<SandboxInstance>> {
+	pub fn instance(&self, instance_idx: u32) -> Result<Rc<SandboxInstance<FR>>> {
 		self.instances
 			.get(instance_idx as usize)
 			.cloned()
@@ -592,7 +557,7 @@ impl Store {
 		}
 	}
 
-	fn register_sandbox_instance(&mut self, sandbox_instance: Rc<SandboxInstance>) -> u32 {
+	fn register_sandbox_instance(&mut self, sandbox_instance: Rc<SandboxInstance<FR>>) -> u32 {
 		let instance_idx = self.instances.len();
 		self.instances.push(Some(sandbox_instance));
 		instance_idx as u32
