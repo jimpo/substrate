@@ -7,11 +7,12 @@ use node_runtime::{
 	constants::currency::*
 };
 use node_testing::keyring::*;
-use primitives::{Blake2Hasher, NativeOrEncoded, NeverNativeValue};
+use primitives::{Blake2Hasher, NativeOrEncoded, NeverNativeValue, storage::well_known_keys};
 use runtime_support::Hashable;
-use state_machine::{CodeExecutor, TestExternalities as CoreTestExternalities};
+use state_machine::{CodeExecutor, Externalities, TestExternalities as CoreTestExternalities};
+use substrate_executor::{NativeExecutor, RuntimeInfo};
 
-criterion_group!(benches, wasm_execute_block);
+criterion_group!(benches, execute_block);
 criterion_main!(benches);
 
 /// The wasm runtime code.
@@ -21,7 +22,16 @@ const GENESIS_HASH: [u8; 32] = [69u8; 32];
 
 const VERSION: u32 = node_runtime::VERSION.spec_version;
 
+const HEAP_PAGES: u64 = 20;
+
 type TestExternalities<H> = CoreTestExternalities<H, u64>;
+
+#[derive(Debug)]
+enum ExecutionStrategy {
+	Native,
+	WasmInterpreted,
+	WasmCompiled,
+}
 
 fn sign(xt: CheckedExtrinsic) -> UncheckedExtrinsic {
 	node_testing::keyring::sign(xt, VERSION, GENESIS_HASH)
@@ -39,41 +49,48 @@ fn new_test_ext(code: &[u8], support_changes_trie: bool) -> TestExternalities<Bl
 // block 1 and 2 must be created together to ensure transactions are only signed once (since they
 // are not guaranteed to be deterministic) and to ensure that the correct state is propagated
 // from block1's execution to block2 to derive the correct storage_root.
-fn blocks() -> ((Vec<u8>, Hash), (Vec<u8>, Hash)) {
+fn blocks(executor: &NativeExecutor<Executor>) -> ((Vec<u8>, Hash), (Vec<u8>, Hash)) {
 	let mut t = new_test_ext(COMPACT_CODE, false);
+	set_heap_pages(&mut t, HEAP_PAGES);
+
+	let mut block1_extrinsics = vec![
+		CheckedExtrinsic {
+			signed: None,
+			function: Call::Timestamp(timestamp::Call::set(42 * 1000)),
+		},
+	];
+//	block1_extrinsics.extend((0..20).map(|i| {
+//		CheckedExtrinsic {
+//			signed: Some((alice(), signed_extra(i, 0))),
+//			function: Call::Balances(balances::Call::transfer(bob().into(), 1 * DOLLARS)),
+//		}
+//	}));
 	let block1 = construct_block(
+		executor,
 		&mut t,
 		1,
 		GENESIS_HASH.into(),
-		vec![
-			CheckedExtrinsic {
-				signed: None,
-				function: Call::Timestamp(timestamp::Call::set(42 * 1000)),
-			},
-			CheckedExtrinsic {
-				signed: Some((alice(), signed_extra(0, 0))),
-				function: Call::Balances(balances::Call::transfer(bob().into(), 69 * DOLLARS)),
-			},
-		]
+		block1_extrinsics,
 	);
+
+	let mut block2_extrinsics = vec![
+		CheckedExtrinsic {
+			signed: None,
+			function: Call::Timestamp(timestamp::Call::set(52 * 1000)),
+		},
+	];
+	block2_extrinsics.extend((0..20).map(|i| {
+		CheckedExtrinsic {
+			signed: Some((alice(), signed_extra(i, 0))),
+			function: Call::Balances(balances::Call::transfer(bob().into(), 1 * DOLLARS)),
+		}
+	}));
 	let block2 = construct_block(
+		executor,
 		&mut t,
 		2,
 		block1.1.clone(),
-		vec![
-			CheckedExtrinsic {
-				signed: None,
-				function: Call::Timestamp(timestamp::Call::set(52 * 1000)),
-			},
-			CheckedExtrinsic {
-				signed: Some((bob(), signed_extra(0, 0))),
-				function: Call::Balances(balances::Call::transfer(alice().into(), 5 * DOLLARS)),
-			},
-			CheckedExtrinsic {
-				signed: Some((alice(), signed_extra(1, 0))),
-				function: Call::Balances(balances::Call::transfer(bob().into(), 15 * DOLLARS)),
-			}
-		]
+		block2_extrinsics,
 	);
 
 	// session change => consensus authorities change => authorities change digest item appears
@@ -84,6 +101,7 @@ fn blocks() -> ((Vec<u8>, Hash), (Vec<u8>, Hash)) {
 }
 
 fn construct_block(
+	executor: &NativeExecutor<Executor>,
 	env: &mut TestExternalities<Blake2Hasher>,
 	number: BlockNumber,
 	parent_hash: Hash,
@@ -109,7 +127,7 @@ fn construct_block(
 	};
 
 	// execute the block to get the real header.
-	executor().call::<_, NeverNativeValue, fn() -> _>(
+	executor.call::<_, NeverNativeValue, fn() -> _>(
 		env,
 		"Core_initialize_block",
 		&header.encode(),
@@ -118,7 +136,7 @@ fn construct_block(
 	).0.unwrap();
 
 	for i in extrinsics.iter() {
-		executor().call::<_, NeverNativeValue, fn() -> _>(
+		executor.call::<_, NeverNativeValue, fn() -> _>(
 			env,
 			"BlockBuilder_apply_extrinsic",
 			&i.encode(),
@@ -127,7 +145,7 @@ fn construct_block(
 		).0.unwrap();
 	}
 
-	let header = match executor().call::<_, NeverNativeValue, fn() -> _>(
+	let header = match executor.call::<_, NeverNativeValue, fn() -> _>(
 		env,
 		"BlockBuilder_finalize_block",
 		&[0u8;0],
@@ -142,36 +160,56 @@ fn construct_block(
 	(Block { header, extrinsics }.encode(), hash.into())
 }
 
-fn executor() -> ::substrate_executor::NativeExecutor<Executor> {
-	substrate_executor::NativeExecutor::new(None)
+fn set_heap_pages<E: Externalities<Blake2Hasher>>(ext: &mut E, heap_pages: u64) {
+	ext.place_storage(well_known_keys::HEAP_PAGES.to_vec(), Some(heap_pages.encode()));
 }
 
-fn wasm_execute_block(c: &mut Criterion) {
-	c.bench_function(
-		"execute blocks with Wasm executor",
-		|b| {
-			let (block1, block2) = blocks();
+fn execute_block(c: &mut Criterion) {
+	c.bench_function_over_inputs(
+		"execute blocks",
+		|b, strategy| {
+			let (use_jit, use_native) = match strategy {
+				ExecutionStrategy::Native => (false, true),
+				ExecutionStrategy::WasmInterpreted => (false, false),
+				ExecutionStrategy::WasmCompiled => (true, false),
+			};
+			let executor = NativeExecutor::new_using_jit(None, use_jit);
+
+			let (block1, block2) = blocks(&executor);
+
+			// Just execute something to compile the Wasm before benchmarking if using the compiled
+			// strategy.
+			executor.runtime_version(&mut new_test_ext(COMPACT_CODE, false));
 
 			b.iter_batched_ref(
-				|| new_test_ext(COMPACT_CODE, false),
-				|ext| {
-					executor().call::<_, NeverNativeValue, fn() -> _>(
-						ext,
+				|| {
+					let mut ext = new_test_ext(COMPACT_CODE, false);
+					set_heap_pages(&mut ext, HEAP_PAGES);
+					executor.call::<_, NeverNativeValue, fn() -> _>(
+						&mut ext,
 						"Core_execute_block",
 						&block1.0,
-						false,
+						use_native,
 						None,
 					).0.unwrap();
-					executor().call::<_, NeverNativeValue, fn() -> _>(
+					ext
+				},
+				|ext| {
+					executor.call::<_, NeverNativeValue, fn() -> _>(
 						ext,
 						"Core_execute_block",
 						&block2.0,
-						false,
+						use_native,
 						None,
 					).0.unwrap();
 				},
 				BatchSize::LargeInput,
 			);
-		}
+		},
+		vec![
+			ExecutionStrategy::Native,
+			ExecutionStrategy::WasmCompiled,
+			ExecutionStrategy::WasmInterpreted,
+		],
 	);
 }

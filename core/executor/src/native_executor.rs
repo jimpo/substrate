@@ -79,7 +79,16 @@ impl<D: NativeExecutionDispatch> NativeExecutor<D> {
 			_dummy: Default::default(),
 			native_version: D::native_version(),
 			default_heap_pages,
-			use_jit: true,
+			use_jit: false,
+		}
+	}
+
+	pub fn new_using_jit(default_heap_pages: Option<u64>, use_jit: bool) -> Self {
+		NativeExecutor {
+			_dummy: Default::default(),
+			native_version: D::native_version(),
+			default_heap_pages,
+			use_jit,
 		}
 	}
 
