@@ -46,6 +46,7 @@ erased-serde = "0.3.9"
 void = "1.0.2"
 zeroize = "0.10.1"
 babe-primitives = { package = "substrate-consensus-babe-primitives", path = "../consensus/babe/primitives" }
+state-machine = { package = "substrate-state-machine", path = "../../core/state-machine" }
 
 [dev-dependencies]
 env_logger = "0.7.0"

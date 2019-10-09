@@ -39,6 +39,7 @@ use event::Event;
 use consensus_gossip::{ConsensusGossip, MessageRecipient as GossipMessageRecipient};
 use light_dispatch::{LightDispatch, LightDispatchNetwork, RequestData};
 use specialization::NetworkSpecialization;
+use state_machine::StorageProof;
 use sync::{ChainSync, SyncState};
 use crate::service::{TransactionPool, ExHashT};
 use crate::config::{BoxFinalityProofRequestBuilder, Roles};
@@ -1231,7 +1232,7 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Protocol<B, S, H> {
 					error
 				);
 				self.peerset_handle.report_peer(who.clone(), RPC_FAILED_REPUTATION_CHANGE);
-				Default::default()
+				StorageProof::empty()
 			}
 		};
 
@@ -1338,8 +1339,8 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Protocol<B, S, H> {
 
 		trace!(target: "sync", "Remote read request {} from {} ({} at {})",
 			request.id, who, keys_str(), request.block);
-		let proof = match self.context_data.chain.read_proof(&request.block, &request.keys) {
-			Ok(proof) => proof,
+		let (values, proof) = match self.context_data.chain.read_proof(&request.block, &request.keys) {
+			Ok((values, proof)) => (values, proof),
 			Err(error) => {
 				trace!(target: "sync", "Remote read request {} from {} ({} at {}) failed with: {}",
 					request.id,
@@ -1348,13 +1349,14 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Protocol<B, S, H> {
 					request.block,
 					error
 				);
-				Default::default()
+				(Vec::new(), StorageProof::empty())
 			}
 		};
 		self.send_message(
 			who,
 			GenericMessage::RemoteReadResponse(message::RemoteReadResponse {
 				id: request.id,
+				values,
 				proof,
 			}),
 		);
@@ -1376,12 +1378,12 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Protocol<B, S, H> {
 
 		trace!(target: "sync", "Remote read child request {} from {} ({} {} at {})",
 			request.id, who, request.storage_key.to_hex::<String>(), keys_str(), request.block);
-		let proof = match self.context_data.chain.read_child_proof(
+		let (values, proof) = match self.context_data.chain.read_child_proof(
 			&request.block,
 			&request.storage_key,
 			&request.keys,
 		) {
-			Ok(proof) => proof,
+			Ok((values, proof)) => (values, proof),
 			Err(error) => {
 				trace!(target: "sync", "Remote read child request {} from {} ({} {} at {}) failed with: {}",
 					request.id,
@@ -1391,13 +1393,14 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Protocol<B, S, H> {
 					request.block,
 					error
 				);
-				Default::default()
+				(Vec::new(), StorageProof::empty())
 			}
 		};
 		self.send_message(
 			who,
 			GenericMessage::RemoteReadResponse(message::RemoteReadResponse {
 				id: request.id,
+				values,
 				proof,
 			}),
 		);
@@ -1431,7 +1434,7 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Protocol<B, S, H> {
 					request.block,
 					error
 				);
-				(Default::default(), Default::default())
+				(None, StorageProof::empty())
 			}
 		};
 		self.send_message(
@@ -1496,11 +1499,11 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Protocol<B, S, H> {
 					request.last,
 					error
 				);
-				ChangesProof::<B::Header> {
+				ChangesProof {
 					max_block: Zero::zero(),
-					proof: vec![],
+					proof: Vec::new(),
 					roots: BTreeMap::new(),
-					roots_proof: vec![],
+					roots_proof: StorageProof::empty(),
 				}
 			}
 		};
@@ -1512,7 +1515,7 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Protocol<B, S, H> {
 				proof: proof.proof,
 				roots: proof.roots.into_iter().collect(),
 				roots_proof: proof.roots_proof,
-			}),
+			})
 		);
 	}
 

@@ -30,7 +30,7 @@ use trie;
 use primitives::{H256, convert_hash};
 use sr_primitives::traits::{Header as HeaderT, SimpleArithmetic, Zero, One};
 use state_machine::backend::InMemory as InMemoryState;
-use state_machine::{MemoryDB, TrieBackend, Backend as StateBackend,
+use state_machine::{MemoryDB, TrieBackend, Backend as StateBackend, StorageProof,
 	prove_read_on_trie_backend, read_proof_check, read_proof_check_on_proving_backend};
 
 use crate::error::{Error as ClientError, Result as ClientResult};
@@ -88,7 +88,7 @@ pub fn build_proof<Header, Hasher, BlocksI, HashesI>(
 	cht_num: Header::Number,
 	blocks: BlocksI,
 	hashes: HashesI
-) -> ClientResult<Vec<Vec<u8>>>
+) -> ClientResult<StorageProof>
 	where
 		Header: HeaderT,
 		Hasher: hash_db::Hasher,
@@ -103,10 +103,11 @@ pub fn build_proof<Header, Hasher, BlocksI, HashesI>(
 	let mut storage = InMemoryState::<Hasher>::default().update(transaction);
 	let trie_storage = storage.as_trie_backend()
 		.expect("InMemoryState::as_trie_backend always returns Some; qed");
-	prove_read_on_trie_backend(
+	let (_, proof) = prove_read_on_trie_backend(
 		trie_storage,
 		blocks.into_iter().map(|number| encode_cht_key(number)),
-	).map_err(ClientError::Execution)
+	).map_err(ClientError::Execution)?;
+	Ok(proof)
 }
 
 /// Check CHT-based header proof.
@@ -114,7 +115,7 @@ pub fn check_proof<Header, Hasher>(
 	local_root: Header::Hash,
 	local_number: Header::Number,
 	remote_hash: Header::Hash,
-	remote_proof: Vec<Vec<u8>>
+	remote_proof: StorageProof,
 ) -> ClientResult<()>
 	where
 		Header: HeaderT,
@@ -125,16 +126,14 @@ pub fn check_proof<Header, Hasher>(
 		local_root,
 		local_number,
 		remote_hash,
-		move |local_root, local_cht_key|
-			read_proof_check::<Hasher, _>(
+		move |local_root, local_cht_key, remote_cht_value| {
+			read_proof_check::<Hasher, _, _, _>(
 				local_root,
 				remote_proof,
-				::std::iter::once(local_cht_key),
+				::std::iter::once((local_cht_key, remote_cht_value)),
 			)
-			.map(|mut map| map
-				.remove(local_cht_key)
-				.expect("checked proof of local_cht_key; qed"))
-			.map_err(|e| ClientError::from(e)),
+				.map_err(|e| ClientError::from(e))
+		},
 	)
 }
 
@@ -154,11 +153,16 @@ pub fn check_proof_on_proving_backend<Header, Hasher>(
 		local_root,
 		local_number,
 		remote_hash,
-		|_, local_cht_key|
-			read_proof_check_on_proving_backend::<Hasher>(
+		|_, local_cht_key, remote_cht_value| {
+			let local_cht_value = read_proof_check_on_proving_backend::<Hasher>(
 				proving_backend,
-				local_cht_key,
-			).map_err(|e| ClientError::from(e)),
+				&local_cht_key,
+			).map_err(|e| ClientError::from(e))?;
+			if local_cht_value != remote_cht_value {
+				return Err(ClientError::InvalidCHTProof);
+			}
+			Ok(())
+		},
 	)
 }
 
@@ -173,18 +177,12 @@ fn do_check_proof<Header, Hasher, F>(
 		Header: HeaderT,
 		Hasher: hash_db::Hasher,
 		Hasher::Out: Ord,
-		F: FnOnce(Hasher::Out, &[u8]) -> ClientResult<Option<Vec<u8>>>,
+		F: FnOnce(Hasher::Out, Vec<u8>, Option<Vec<u8>>) -> ClientResult<()>,
 {
 	let root: Hasher::Out = convert_hash(&local_root);
 	let local_cht_key = encode_cht_key(local_number);
-	let local_cht_value = checker(root, &local_cht_key)?;
-	let local_cht_value = local_cht_value.ok_or_else(|| ClientError::InvalidCHTProof)?;
-	let local_hash = decode_cht_value(&local_cht_value).ok_or_else(|| ClientError::InvalidCHTProof)?;
-	match &local_hash[..] == remote_hash.as_ref() {
-		true => Ok(()),
-		false => Err(ClientError::InvalidCHTProof.into()),
-	}
-
+	let remote_cht_value = encode_cht_value(remote_hash);
+	checker(root, local_cht_key, Some(remote_cht_value))
 }
 
 /// Group ordered blocks by CHT number and call functor with blocks of each group.

@@ -51,6 +51,7 @@ use sr_primitives::{
 use primitives::{H256, Blake2Hasher};
 use substrate_telemetry::{telemetry, CONSENSUS_INFO};
 use fg_primitives::AuthorityId;
+use state_machine::StorageProof;
 
 use crate::justification::GrandpaJustification;
 
@@ -62,7 +63,7 @@ pub trait AuthoritySetForFinalityProver<Block: BlockT>: Send + Sync {
 	/// Call GrandpaApi::grandpa_authorities at given block.
 	fn authorities(&self, block: &BlockId<Block>) -> ClientResult<Vec<(AuthorityId, u64)>>;
 	/// Prove call of GrandpaApi::grandpa_authorities at given block.
-	fn prove_authorities(&self, block: &BlockId<Block>) -> ClientResult<Vec<Vec<u8>>>;
+	fn prove_authorities(&self, block: &BlockId<Block>) -> ClientResult<StorageProof>;
 }
 
 /// Client-based implementation of AuthoritySetForFinalityProver.
@@ -85,7 +86,7 @@ impl<B, E, Block: BlockT<Hash=H256>, RA> AuthoritySetForFinalityProver<Block> fo
 			)))
 	}
 
-	fn prove_authorities(&self, block: &BlockId<Block>) -> ClientResult<Vec<Vec<u8>>> {
+	fn prove_authorities(&self, block: &BlockId<Block>) -> ClientResult<StorageProof> {
 		self.execution_proof(block, "GrandpaApi_grandpa_authorities",&[]).map(|(_, proof)| proof)
 	}
 }
@@ -97,7 +98,7 @@ pub trait AuthoritySetForFinalityChecker<Block: BlockT>: Send + Sync {
 		&self,
 		hash: Block::Hash,
 		header: Block::Header,
-		proof: Vec<Vec<u8>>,
+		proof: StorageProof,
 	) -> ClientResult<Vec<(AuthorityId, u64)>>;
 }
 
@@ -107,7 +108,7 @@ impl<Block: BlockT> AuthoritySetForFinalityChecker<Block> for Arc<dyn FetchCheck
 		&self,
 		hash: Block::Hash,
 		header: Block::Header,
-		proof: Vec<Vec<u8>>,
+		proof: StorageProof,
 	) -> ClientResult<Vec<(AuthorityId, u64)>> {
 		let request = RemoteCallRequest {
 			block: hash,
@@ -207,7 +208,7 @@ struct FinalityProofFragment<Header: HeaderT> {
 	/// The set of headers in the range (U; F] that we believe are unknown to the caller. Ordered.
 	pub unknown_headers: Vec<Header>,
 	/// Optional proof of execution of GRANDPA::authorities().
-	pub authorities_proof: Option<Vec<Vec<u8>>>,
+	pub authorities_proof: Option<StorageProof>,
 }
 
 /// Proof of finality is the ordered set of finality fragments, where:

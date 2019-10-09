@@ -30,7 +30,8 @@ use sr_primitives::traits::{
 };
 use state_machine::{
 	ChangesTrieRootsStorage, ChangesTrieAnchorBlockId, ChangesTrieConfigurationRange,
-	TrieBackend, read_proof_check, key_changes_proof_check, create_proof_check_backend_storage,
+	TrieBackend, StorageProof,
+	read_proof_check, key_changes_proof_check, create_proof_check_backend_storage,
 	read_child_proof_check,
 };
 
@@ -118,7 +119,7 @@ pub struct RemoteChangesRequest<Header: HeaderT> {
 }
 
 /// Key changes read proof.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct ChangesProof<Header: HeaderT> {
 	/// Max block that has been used in changes query.
 	pub max_block: Header::Number,
@@ -129,7 +130,7 @@ pub struct ChangesProof<Header: HeaderT> {
 	pub roots: BTreeMap<Header::Number, Header::Hash>,
 	/// The proofs for all changes tries roots that have been touched AND are
 	/// missing from the requester' node. It is a map of CHT number => proof.
-	pub roots_proof: Vec<Vec<u8>>,
+	pub roots_proof: StorageProof,
 }
 
 /// Remote block body request
@@ -185,26 +186,28 @@ pub trait FetchChecker<Block: BlockT>: Send + Sync {
 	fn check_header_proof(
 		&self,
 		request: &RemoteHeaderRequest<Block::Header>,
-		header: Option<Block::Header>,
-		remote_proof: Vec<Vec<u8>>
-	) -> ClientResult<Block::Header>;
+		header: &Block::Header,
+		remote_proof: StorageProof,
+	) -> ClientResult<()>;
 	/// Check remote storage read proof.
 	fn check_read_proof(
 		&self,
 		request: &RemoteReadRequest<Block::Header>,
-		remote_proof: Vec<Vec<u8>>
-	) -> ClientResult<HashMap<Vec<u8>, Option<Vec<u8>>>>;
+		remote_values: &[Option<Vec<u8>>],
+		remote_proof: StorageProof,
+	) -> ClientResult<()>;
 	/// Check remote storage read proof.
 	fn check_read_child_proof(
 		&self,
 		request: &RemoteReadChildRequest<Block::Header>,
-		remote_proof: Vec<Vec<u8>>
-	) -> ClientResult<HashMap<Vec<u8>, Option<Vec<u8>>>>;
+		remote_values: &[Option<Vec<u8>>],
+		remote_proof: StorageProof,
+	) -> ClientResult<()>;
 	/// Check remote method execution proof.
 	fn check_execution_proof(
 		&self,
 		request: &RemoteCallRequest<Block::Header>,
-		remote_proof: Vec<Vec<u8>>
+		remote_proof: StorageProof,
 	) -> ClientResult<Vec<u8>>;
 	/// Check remote changes query proof.
 	fn check_changes_proof(
@@ -318,7 +321,7 @@ impl<E, H, B: BlockT, S: BlockchainStorage<B>> LightDataChecker<E, H, B, S> {
 		&self,
 		cht_size: NumberFor<B>,
 		remote_roots: &BTreeMap<NumberFor<B>, B::Hash>,
-		remote_roots_proof: Vec<Vec<u8>>,
+		remote_roots_proof: StorageProof,
 	) -> ClientResult<()>
 		where
 			H: Hasher,
@@ -377,49 +380,59 @@ impl<E, Block, H, S> FetchChecker<Block> for LightDataChecker<E, H, Block, S>
 	fn check_header_proof(
 		&self,
 		request: &RemoteHeaderRequest<Block::Header>,
-		remote_header: Option<Block::Header>,
-		remote_proof: Vec<Vec<u8>>
-	) -> ClientResult<Block::Header> {
-		let remote_header = remote_header.ok_or_else(||
-			ClientError::from(ClientError::InvalidCHTProof))?;
+		remote_header: &Block::Header,
+		remote_proof: StorageProof,
+	) -> ClientResult<()> {
 		let remote_header_hash = remote_header.hash();
 		cht::check_proof::<Block::Header, H>(
 			request.cht_root,
 			request.block,
 			remote_header_hash,
-			remote_proof)
-			.map(|_| remote_header)
+			remote_proof
+		)
 	}
 
 	fn check_read_proof(
 		&self,
 		request: &RemoteReadRequest<Block::Header>,
-		remote_proof: Vec<Vec<u8>>,
-	) -> ClientResult<HashMap<Vec<u8>, Option<Vec<u8>>>> {
-		read_proof_check::<H, _>(
+		remote_values: &[Option<Vec<u8>>],
+		remote_proof: StorageProof,
+	) -> ClientResult<()> {
+		if request.keys.len() != remote_values.len() {
+			return Err("received incorrect number of remote values".into());
+		}
+		let keys_iter = request.keys.iter();
+		let values_iter = remote_values.iter().map(|v| v.as_ref());
+		read_proof_check::<H, _, _, _>(
 			convert_hash(request.header.state_root()),
 			remote_proof,
-			request.keys.iter(),
+			keys_iter.zip(values_iter)
 		).map_err(Into::into)
 	}
 
 	fn check_read_child_proof(
 		&self,
 		request: &RemoteReadChildRequest<Block::Header>,
-		remote_proof: Vec<Vec<u8>>
-	) -> ClientResult<HashMap<Vec<u8>, Option<Vec<u8>>>> {
-		read_child_proof_check::<H, _>(
+		remote_values: &[Option<Vec<u8>>],
+		remote_proof: StorageProof,
+	) -> ClientResult<()> {
+		if request.keys.len() != remote_values.len() {
+			return Err("received incorrect number of remote values".into());
+		}
+		let keys_iter = request.keys.iter();
+		let values_iter = remote_values.iter().map(|v| v.as_ref());
+		read_child_proof_check::<H, _, _, _>(
 			convert_hash(request.header.state_root()),
 			remote_proof,
 			&request.storage_key,
-			request.keys.iter(),
+			keys_iter.zip(values_iter)
 		).map_err(Into::into)
 	}
 
 	fn check_execution_proof(
 		&self,
 		request: &RemoteCallRequest<Block::Header>,
-		remote_proof: Vec<Vec<u8>>
+		remote_proof: StorageProof,
 	) -> ClientResult<Vec<u8>> {
 		check_execution_proof::<_, _, H>(&self.executor, request, remote_proof)
 	}

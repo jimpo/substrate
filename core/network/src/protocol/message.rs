@@ -19,6 +19,7 @@
 use bitflags::bitflags;
 use sr_primitives::{ConsensusEngineId, traits::{Block as BlockT, Header as HeaderT}};
 use codec::{Encode, Decode, Input, Output, Error};
+use state_machine::StorageProof;
 pub use self::generic::{
 	BlockAnnounce, RemoteCallRequest, RemoteReadRequest,
 	RemoteHeaderRequest, RemoteHeaderResponse,
@@ -122,7 +123,7 @@ pub struct RemoteCallResponse {
 	/// Id of a request this response was made for.
 	pub id: RequestId,
 	/// Execution proof.
-	pub proof: Vec<Vec<u8>>,
+	pub proof: StorageProof,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Encode, Decode)]
@@ -130,8 +131,10 @@ pub struct RemoteCallResponse {
 pub struct RemoteReadResponse {
 	/// Id of a request this response was made for.
 	pub id: RequestId,
+	/// The values read for the requested keys.
+	pub values: Vec<Option<Vec<u8>>>,
 	/// Read proof.
-	pub proof: Vec<Vec<u8>>,
+	pub proof: StorageProof,
 }
 
 /// Generic types.
@@ -142,7 +145,7 @@ pub mod generic {
 	use super::{
 		RemoteReadResponse, Transactions, Direction,
 		RequestId, BlockAttributes, RemoteCallResponse, ConsensusEngineId,
-		BlockState,
+		BlockState, StorageProof,
 	};
 	/// Consensus is mostly opaque to us
 	#[derive(Debug, PartialEq, Eq, Clone, Encode, Decode)]
@@ -359,7 +362,7 @@ pub mod generic {
 		/// Header. None if proof generation has failed (e.g. header is unknown).
 		pub header: Option<Header>,
 		/// Header proof.
-		pub proof: Vec<Vec<u8>>,
+		pub proof: StorageProof,
 	}
 
 	#[derive(Debug, PartialEq, Eq, Clone, Encode, Decode)]
@@ -374,7 +377,7 @@ pub mod generic {
 		/// Hash of the first block for which the requester has the changes trie root. All other
 		/// affected roots must be proved.
 		pub min: H,
-		/// Hash of the last block that we can use when querying changes.
+		// Hash of the last block that we can use when querying changes.
 		pub max: H,
 		/// Storage child node key which changes are requested.
 		pub storage_key: Option<Vec<u8>>,
@@ -395,7 +398,7 @@ pub mod generic {
 		/// Changes tries roots missing on the requester' node.
 		pub roots: Vec<(N, H)>,
 		/// Missing changes tries roots proof.
-		pub roots_proof: Vec<Vec<u8>>,
+		pub roots_proof: StorageProof,
 	}
 
 	#[derive(Debug, PartialEq, Eq, Clone, Encode, Decode)]
