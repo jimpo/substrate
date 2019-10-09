@@ -671,7 +671,7 @@ impl CheckedAdd for Fixed64 {
 /// Infinite precision unsigned integer for substrate runtime.
 pub mod big_num {
 	use super::Zero;
-	use rstd::{cmp::Ordering, ops, prelude::*, cell::RefCell, convert::TryFrom};
+	use rstd::{cmp::{self, Ordering}, ops, prelude::*, cell::RefCell, convert::TryFrom};
 
 	// A sensible value for this would be half of the dword size of the host machine. Since the
 	// runtime is compiled to 32bit webassembly, using 32 and 64 for single and double respectively
@@ -755,20 +755,16 @@ pub mod big_num {
 		/// Number of limbs.
 		pub fn len(&self) -> usize { self.digits.len() }
 
-		/// A naive getter for limb at `index`. Note that the order is lsb -> msb.
+		/// A getter for limb at `index` which returns 0 for out-of-range access.
 		///
-		/// #### Panics
-		///
-		/// This panics if index is out of range.
+		/// Note that the order is lsb -> msb.
 		pub fn get(&self, index: usize) -> Single {
-			self.digits[index]
+			self.checked_get(index).unwrap_or_default()
 		}
 
-		/// A checked getter for limb at `index`. Note that the order is lsb -> msb.
+		/// A checked getter for limb at `index` which returns None for out-of-range access.
 		///
-		/// #### Panics
-		///
-		/// This panics if index is out of range.
+		/// Note that the order is lsb -> msb.
 		pub fn checked_get(&self, index: usize) -> Option<Single> {
 			self.digits.get(index).cloned()
 		}
@@ -811,7 +807,7 @@ pub mod big_num {
 				if *elem != 0 { break } else { index -= 1 }
 			}
 			if index < self.len() {
-				self.digits = self.digits[..index].to_vec()
+				self.digits.truncate(index);
 			}
 		}
 
@@ -820,19 +816,7 @@ pub mod big_num {
 		pub fn pad(&mut self, size: usize) {
 			let n = self.len();
 			if n >= size { return; }
-			let pad = size - n;
-			let new_digits = (0..pad).map(|_| 0).collect::<Vec<Single>>();
-			self.digits.extend(new_digits);
-		}
-
-		/// Extends either one of `self` or `other` to meet the size of the other one. Equivalent of
-		/// using `pad()` of the smaller one with the size of the bigger one.
-		pub fn resize(&mut self, other: &mut Self) {
-			if self.len() >= other.len() {
-				other.pad(self.len())
-			} else if other.len() > self.len() {
-				self.pad(other.len())
-			}
+			self.digits.resize(size, 0);
 		}
 
 		/// Adds `self` with `other`. self and other do not have to have any particular size. Given
@@ -843,9 +827,8 @@ pub mod big_num {
 		/// limbs. The caller may strip the output if desired.
 		///
 		/// Taken from "The Art of Computer Programming" by D.E. Knuth, vol 2, chapter 4.
-		pub fn add(mut self, mut other: Self) -> Self {
-			Self::resize(&mut self, &mut other);
-			let n = self.len();
+		pub fn add(self, other: Self) -> Self {
+			let n = cmp::max(self.len(), other.len());
 			let mut k: Double = 0;
 			let mut w = Self::with_capacity(n + 1);
 
@@ -867,9 +850,8 @@ pub mod big_num {
 		/// If `other` is bigger than `self`, `Err(B - borrow)` is returned.
 		///
 		/// Taken from "The Art of Computer Programming" by D.E. Knuth, vol 2, chapter 4.
-		pub fn sub(mut self, mut other: Self) -> Result<Self, Self> {
-			Self::resize(&mut self, &mut other);
-			let n = self.len();
+		pub fn sub(self, other: Self) -> Result<Self, Self> {
+			let n = cmp::max(self.len(), other.len());
 			let mut k = 0;
 			let mut w = Self::with_capacity(n);
 			for j in 0..n {
@@ -1298,15 +1280,6 @@ pub mod big_num {
 		}
 
 		#[test]
-		fn resize_works() {
-			let mut a = Number::from_limbs(&[0, 1, 0]);
-			let mut b = Number::from_limbs(&[1, 1]);
-			a.resize(&mut b);
-			assert_eq!(a.digits, vec![0, 1, 0]);
-			assert_eq!(b.digits, vec![1, 1, 0]);
-		}
-
-		#[test]
 		fn pad_works() {
 			let mut a = Number::from_limbs(&[0, 1, 0]);
 			a.pad(2);
@@ -1556,6 +1529,16 @@ pub mod big_num {
 
 		#[cfg(feature = "bench")]
 		#[bench]
+		fn bench_addition_64_digit(bencher: &mut Bencher) {
+			let a = random_big_num(64);
+			let b = random_big_num(64);
+			bencher.iter(|| {
+				let _ = a.clone().add(b.clone());
+			});
+		}
+
+		#[cfg(feature = "bench")]
+		#[bench]
 		fn bench_subtraction_2_digit(bencher: &mut Bencher) {
 			let a = random_big_num(2);
 			let b = random_big_num(2);
@@ -1576,6 +1559,16 @@ pub mod big_num {
 
 		#[cfg(feature = "bench")]
 		#[bench]
+		fn bench_subtraction_64_digit(bencher: &mut Bencher) {
+			let a = random_big_num(64);
+			let b = random_big_num(64);
+			bencher.iter(|| {
+				let _ = a.clone().sub(b.clone());
+			});
+		}
+
+		#[cfg(feature = "bench")]
+		#[bench]
 		fn bench_multiplication_2_digit(bencher: &mut Bencher) {
 			let a = random_big_num(2);
 			let b = random_big_num(2);
@@ -1589,6 +1582,16 @@ pub mod big_num {
 		fn bench_multiplication_4_digit(bencher: &mut Bencher) {
 			let a = random_big_num(4);
 			let b = random_big_num(4);
+			bencher.iter(|| {
+				let _ = a.clone().mul(b.clone());
+			});
+		}
+
+		#[cfg(feature = "bench")]
+		#[bench]
+		fn bench_multiplication_64_digit(bencher: &mut Bencher) {
+			let a = random_big_num(64);
+			let b = random_big_num(64);
 			bencher.iter(|| {
 				let _ = a.clone().mul(b.clone());
 			});
