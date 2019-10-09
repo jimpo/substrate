@@ -827,21 +827,21 @@ pub mod big_num {
 		/// limbs. The caller may strip the output if desired.
 		///
 		/// Taken from "The Art of Computer Programming" by D.E. Knuth, vol 2, chapter 4.
-		pub fn add(self, other: Self) -> Self {
+		pub fn add(mut self, other: Self) -> Self {
 			let n = cmp::max(self.len(), other.len());
 			let mut k: Double = 0;
-			let mut w = Self::with_capacity(n + 1);
+			self.pad(n + 1);
 
 			for j in 0..n {
 				let u = Double::from(self.get(j));
 				let v = Double::from(other.get(j));
 				let s = u + v + k;
-				w.set(j, (s % B) as Single);
+				self.set(j, (s % B) as Single);
 				k = s / B;
 			}
 			// k is always 0 or 1.
-			w.set(n, k as Single);
-			w
+			self.set(n, k as Single);
+			self
 		}
 
 		/// Subtracts `other` from `self`. self and other do not have to have any particular size.
@@ -850,10 +850,10 @@ pub mod big_num {
 		/// If `other` is bigger than `self`, `Err(B - borrow)` is returned.
 		///
 		/// Taken from "The Art of Computer Programming" by D.E. Knuth, vol 2, chapter 4.
-		pub fn sub(self, other: Self) -> Result<Self, Self> {
+		pub fn sub(mut self, other: Self) -> Result<Self, Self> {
 			let n = cmp::max(self.len(), other.len());
 			let mut k = 0;
-			let mut w = Self::with_capacity(n);
+			self.pad(n);
 			for j in 0..n {
 				let s = {
 					let u = Double::from(self.get(j));
@@ -880,13 +880,13 @@ pub mod big_num {
 				// PROOF: t either comes from `v2 % B`, or from `u + B - v - k`. The former is
 				// trivial. The latter will not overflow this branch will only happen if the sum of
 				// `u - v - k` part has been negative, hence `u + B - v - k < b`.
-				w.set(j, s as Single);
+				self.set(j, s as Single);
 			}
 
 			if k.is_zero() {
-				Ok(w)
+				Ok(self)
 			} else {
-				Err(w)
+				Err(self)
 			}
 		}
 
@@ -930,19 +930,18 @@ pub mod big_num {
 		/// division cannot work due to the divisor (`other`) being just one limb.
 		///
 		/// Invariant: `other` cannot be zero.
-		pub fn div_unit(self, mut other: Single) -> Self {
+		pub fn div_unit(mut self, mut other: Single) -> Self {
 			other = other.max(1);
 			let n = self.len();
-			let mut out = Self::with_capacity(n);
 			let mut r: Single = 0;
 			// PROOF: (B-1) * B + (B-1) still fits in double
 			let with_r = |x: Double, r: Single| { r as Double * B + x };
 			for d in (0..=n-1).rev() {
 				let (q, rr) = div_single(with_r(self.get(d).into(), r), other) ;
-				out.set(d, q as Single);
+				self.set(d, q as Single);
 				r = rr;
 			}
-			out
+			self
 		}
 
 		/// Divides an `n + m` limb self by a `n` limb `other`. The result is a `m + 1` limb
