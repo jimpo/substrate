@@ -39,7 +39,7 @@ mod allocator;
 mod host_interface;
 mod wasm_runtime;
 #[cfg(feature = "wasmtime")]
-mod wasmtime_executor;
+mod wasmtime;
 
 pub mod error;
 pub use wasmi;

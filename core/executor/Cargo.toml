@@ -25,9 +25,9 @@ tiny-keccak = "1.5.0"
 
 cranelift-codegen = { version = "0.40", optional = true }
 cranelift-entity = { version = "0.40", optional = true }
+cranelift-frontend = { version = "0.40", optional = true }
 cranelift-native = { version = "0.40", optional = true }
 cranelift-wasm = { version = "0.40", optional = true }
-target-lexicon = { version = "0.8", optional = true }
 wasmtime-jit = { version = "0.3", optional = true }
 wasmtime-environ = { version = "0.3", optional = true }
 wasmtime-runtime = { version = "0.3", optional = true }
