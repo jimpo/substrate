@@ -19,7 +19,7 @@
 use serializer;
 use wasmi;
 #[cfg(feature = "wasmtime")]
-use wasmtime_jit::SetupError;
+use wasmtime_jit::{ActionError, SetupError};
 
 /// Result type alias.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -33,6 +33,9 @@ pub enum Error {
 	Trap(wasmi::Trap),
 	/// Wasmi loading/instantiating error
 	Wasmi(wasmi::Error),
+	/// Wasmtime action error
+	#[cfg(feature = "wasmtime")]
+	Wasmtime(ActionError),
 	/// Error in the API. Parameter is an error message.
 	ApiError(String),
 	/// Method is not found
@@ -63,12 +66,6 @@ pub enum Error {
 	/// allocator is allowed to place its data.
 	#[display(fmt="The runtime doesn't provide a global named `__heap_base`")]
 	HeapBaseNotFoundOrInvalid,
-	/// The runtime must provide a linear memory named `__memory`.
-	#[display(fmt="The runtime doesn't provide a memory named `__memory`")]
-	MemoryNotFoundOrInvalid,
-	/// The runtime must provide a table named `__indirect_functiontable`.
-	#[display(fmt="The runtime doesn't provide a table named `__indirect_function_table`")]
-	IndirectTableNotFoundOrInvalid,
 	/// The runtime WebAssembly module is not allowed to have the `start` function.
 	#[display(fmt="The runtime has the `start` function")]
 	RuntimeHasStartFn,
@@ -83,7 +80,7 @@ pub enum Error {
 	/// Someone tried to allocate more memory than the allowed maximum per allocation.
 	#[display(fmt="Requested allocation size is too large")]
 	RequestedAllocationTooLarge,
-	/// Executing the given function failed with the given error.
+	/// Executing the given function faihost state of led with the given error.
 	#[display(fmt="Function execution failed with: {}", _0)]
 	FunctionExecution(String),
 }

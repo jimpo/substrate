@@ -3,17 +3,16 @@ use cranelift_codegen::ir::{StackSlotData, StackSlotKind, TrapCode};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use wasmtime_runtime::{VMContext, VMFunctionBody};
 use wasm_interface::{HostFunctions, Function, Value, ValueType};
-use std::{cmp, ptr};
+use std::{cmp, mem, ptr};
 
 use crate::error::{Error, Result};
 use crate::wasmtime::code_memory::CodeMemory;
 use crate::wasmtime::function_executor::{FunctionExecutorState, FunctionExecutor};
-use crate::host_interface::SubstrateExternals;
 
 pub struct TrampolineState {
 	externals: &'static [&'static dyn Function],
 	trap: Option<String>,
-	executor_state: Option<FunctionExecutorState<'static>>,
+	pub executor_state: Option<FunctionExecutorState>,
 	// The code memory must be kept around on the state to prevent it from being dropped.
 	#[allow(dead_code)]
 	code_memory: CodeMemory,
@@ -28,14 +27,18 @@ impl TrampolineState {
 			code_memory,
 		}
 	}
+
+	pub fn reset_trap(&mut self) -> Option<String> {
+		mem::replace(&mut self.trap, None)
+	}
 }
 
 unsafe extern "C" fn stub_fn(vmctx: *mut VMContext, func_index: u32, values_vec: *mut i64) -> u32 {
 	if let Some(state) = (*vmctx).host_state().downcast_mut::<TrampolineState>() {
 		match stub_fn_delegate(
-			vmctx: *mut VMContext,
+			vmctx,
 			state.externals,
-			call_id,
+			func_index,
 			&mut state.executor_state,
 			values_vec
 		) {
@@ -96,13 +99,13 @@ pub fn make_trampoline(
 	));
 
 	// Add the `call_id` parameter.
-	stub_sig.params.push(ir::AbiParam::new(types::I32));
+	stub_sig.params.push(ir::AbiParam::new(ir::types::I32));
 
 	// Add the `values_vec` parameter.
 	stub_sig.params.push(ir::AbiParam::new(pointer_type));
 
 	// Add error/trap return.
-	stub_sig.returns.push(ir::AbiParam::new(types::I32));
+	stub_sig.returns.push(ir::AbiParam::new(ir::types::I32));
 
 	let values_vec_len = 8 * cmp::max(signature.params.len() - 1, signature.returns.len()) as u32;
 
@@ -141,7 +144,7 @@ pub fn make_trampoline(
 		}
 
 		let vmctx_ptr_val = builder.func.dfg.ebb_params(block0)[0];
-		let call_id_val = builder.ins().iconst(types::I32, call_id as i64);
+		let call_id_val = builder.ins().iconst(ir::types::I32, call_id as i64);
 
 		let callee_args = vec![vmctx_ptr_val, call_id_val, values_vec_ptr_val];
 
@@ -213,6 +216,14 @@ impl binemit::RelocSink for RelocSink {
 		_addend: binemit::Addend,
 	) {
 		panic!("trampoline compilation should not produce external symbol relocs");
+	}
+	fn reloc_constant(
+		&mut self,
+		_code_offset: binemit::CodeOffset,
+		_reloc: binemit::Reloc,
+		_constant_offset: ir::ConstantOffset,
+	) {
+		panic!("trampoline compilation should not produce constant relocs");
 	}
 	fn reloc_jt(
 		&mut self,

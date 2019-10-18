@@ -1,9 +1,7 @@
 //! Memory management for executable code.
 // Copy of wasmtime's wasmtime-jit/src/code_memory.rs
 
-use alloc::string::String;
-use alloc::vec::Vec;
-use core::{cmp, mem};
+use std::{cmp, mem};
 use region;
 use wasmtime_runtime::{Mmap, VMFunctionBody};
 
