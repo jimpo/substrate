@@ -17,9 +17,9 @@
 use crate::error::{Error, Result, WasmError};
 use crate::host_interface::SubstrateExternals;
 use crate::wasm_runtime::WasmRuntime;
-use crate::wasmtime::code_memory::CodeMemory;
 use crate::wasmtime::function_executor::{FunctionExecutorState, write_memory_from, read_memory_into};
 use crate::wasmtime::trampoline::{TrampolineState, make_trampoline};
+use crate::wasmtime::util::cranelift_ir_signature;
 use crate::{Externalities, RuntimeVersion};
 
 use cranelift_codegen::ir::types;
@@ -33,12 +33,10 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::mem;
 use std::rc::Rc;
-use wasm_interface::{
-	Function, FunctionContext, HostFunctions, Pointer, Signature, ValueType, WordSize,
-};
+use wasm_interface::{HostFunctions, Pointer, Signature, ValueType, WordSize};
 use wasmtime_environ::{translate_signature, Module, WASM_PAGE_SIZE};
 use wasmtime_jit::{
-	ActionOutcome, ActionError, CompilationStrategy, CompiledModule, Compiler, Context, Features,
+	ActionOutcome, ActionError, CodeMemory, CompilationStrategy, CompiledModule, Compiler, Context,
 	SetupError, RuntimeValue,
 };
 use wasmtime_runtime::{Export, Imports, InstanceHandle, VMFunctionBody};
@@ -49,13 +47,6 @@ struct WasmtimeRuntime {
 	min_heap_pages: u32,
 	heap_pages: u32,
 	version: Option<RuntimeVersion>,
-}
-
-impl WasmtimeRuntime {
-	fn clear_globals(&mut self) {
-		let mut global_exports = self.context.get_global_exports();
-		let mut global_exports = global_exports.borrow_mut();
-	}
 }
 
 impl WasmRuntime for WasmtimeRuntime {
@@ -87,7 +78,7 @@ impl WasmRuntime for WasmtimeRuntime {
 
 			// Initialize the function executor state.
 			let executor_state = FunctionExecutorState::new(
-				mem::transmute::<_, &'static mut Compiler>(self.context.compiler()),
+				mem::transmute::<_, &'static mut Compiler>(self.context.compiler_mut()),
 				get_heap_base(&instance)?,
 			);
 			reset_host_state(&mut self.context, Some(executor_state))?;
@@ -103,7 +94,7 @@ impl WasmRuntime for WasmtimeRuntime {
 				.invoke(&mut instance, method, &args[..])
 				.map_err(Error::Wasmtime)
 		})?;
-		let trap_message = reset_host_state(&mut self.context, None)?;
+		let trap_error = reset_host_state(&mut self.context, None)?;
 		let (output_ptr, output_len) = match outcome {
 			ActionOutcome::Returned { values } => {
 				if values.len()	!= 1 {
@@ -118,13 +109,13 @@ impl WasmRuntime for WasmtimeRuntime {
 				}
 			}
 			ActionOutcome::Trapped { message } =>
-				return Err(Error::FunctionExecution(trap_message.unwrap_or(message))),
+				return Err(trap_error.unwrap_or_else(|| Error::FunctionExecution(message))),
 		};
 
 		// Read the output data from guest memory.
 		let mut output = vec![0; output_len];
 		let memory = unsafe { get_memory_mut(&mut instance)? };
-		read_memory_into(memory, output_ptr, &mut output);
+		read_memory_into(memory, output_ptr, &mut output)?;
 		Ok(output)
 	}
 
@@ -215,31 +206,6 @@ fn target_isa() -> std::result::Result<Box<dyn TargetIsa>, WasmError> {
 	Ok(isa_builder.finish(cranelift_codegen::settings::Flags::new(flag_builder)))
 }
 
-/// Convert a wasm_interface Signature into a cranelift_codegen Signature.
-fn cranelift_ir_signature(signature: Signature, call_conv: &isa::CallConv) -> ir::Signature {
-	ir::Signature {
-		params: signature.args.iter()
-			.map(cranelift_ir_type)
-			.map(ir::AbiParam::new)
-			.collect(),
-		returns: signature.return_value.iter()
-			.map(cranelift_ir_type)
-			.map(ir::AbiParam::new)
-			.collect(),
-		call_conv: call_conv.clone(),
-	}
-}
-
-/// Convert a wasm_interface ValueType into a cranelift_codegen Type.
-fn cranelift_ir_type(value_type: &ValueType) -> types::Type {
-	match value_type {
-		ValueType::I32 => types::I32,
-		ValueType::I64 => types::I64,
-		ValueType::F32 => types::F32,
-		ValueType::F64 => types::F64,
-	}
-}
-
 // Old exports get clobbered if we don't explicitly remove them first.
 // TODO: open an issue on wasmtime and reference it here
 fn clear_globals(global_exports: &mut HashMap<String, Option<Export>>) {
@@ -277,7 +243,7 @@ fn get_host_state(context: &mut Context) -> Result<&mut TrampolineState> {
 }
 
 fn reset_host_state(context: &mut Context, executor_state: Option<FunctionExecutorState>)
-	-> Result<Option<String>>
+	-> Result<Option<Error>>
 {
 	let trampoline_state = get_host_state(context)?;
 	trampoline_state.executor_state = executor_state;
@@ -291,28 +257,28 @@ unsafe fn inject_input_data(
 ) -> Result<(Pointer<u8>, WordSize)> {
 	let trampoline_state = get_host_state(context)?;
 	let executor_state = trampoline_state.executor_state
+		.as_mut()
 		.ok_or_else(|| "cannot get \"env\" module executor state")?;
 
 	let memory = get_memory_mut(instance)?;
 
 	let data_len = data.len() as WordSize;
-	let data_ptr = executor_state.heap.allocate_memory(memory, data_len)?;
+	let data_ptr = executor_state.heap().allocate(memory, data_len)?;
 	write_memory_from(memory, data_ptr, data)?;
 	Ok((data_ptr, data_len))
 }
 
 unsafe fn get_heap_base(instance: &InstanceHandle) -> Result<u32> {
 	match instance.lookup_immutable("__heap_base") {
-		Some(Export::Global { definition, vmctx: _, global: _ }) => unsafe {
-			Ok(*(*definition).as_u32())
-		}
+		Some(Export::Global { definition, vmctx: _, global: _ }) =>
+			Ok(*(*definition).as_u32()),
 		_ => return Err(Error::HeapBaseNotFoundOrInvalid),
 	}
 }
 
 unsafe fn get_memory_mut(instance: &mut InstanceHandle) -> Result<&mut [u8]> {
 	match instance.lookup("memory") {
-		Some(Export::Memory { definition, vmctx: _, memory }) =>
+		Some(Export::Memory { definition, vmctx: _, memory: _ }) =>
 			Ok(std::slice::from_raw_parts_mut(
 				(*definition).base,
 				(*definition).current_length,

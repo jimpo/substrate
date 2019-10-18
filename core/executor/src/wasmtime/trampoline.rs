@@ -1,17 +1,17 @@
 use cranelift_codegen::{Context, binemit, ir, isa};
-use cranelift_codegen::ir::{StackSlotData, StackSlotKind, TrapCode};
+use cranelift_codegen::ir::{InstBuilder, StackSlotData, StackSlotKind, TrapCode};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use wasmtime_jit::CodeMemory;
 use wasmtime_runtime::{VMContext, VMFunctionBody};
 use wasm_interface::{HostFunctions, Function, Value, ValueType};
 use std::{cmp, mem, ptr};
 
 use crate::error::{Error, Result};
-use crate::wasmtime::code_memory::CodeMemory;
 use crate::wasmtime::function_executor::{FunctionExecutorState, FunctionExecutor};
 
 pub struct TrampolineState {
 	externals: &'static [&'static dyn Function],
-	trap: Option<String>,
+	trap: Option<Error>,
 	pub executor_state: Option<FunctionExecutorState>,
 	// The code memory must be kept around on the state to prevent it from being dropped.
 	#[allow(dead_code)]
@@ -28,7 +28,7 @@ impl TrampolineState {
 		}
 	}
 
-	pub fn reset_trap(&mut self) -> Option<String> {
+	pub fn reset_trap(&mut self) -> Option<Error> {
 		mem::replace(&mut self.trap, None)
 	}
 }
@@ -39,7 +39,7 @@ unsafe extern "C" fn stub_fn(vmctx: *mut VMContext, func_index: u32, values_vec:
 			vmctx,
 			state.externals,
 			func_index,
-			&mut state.executor_state,
+			state.executor_state.as_mut(),
 			values_vec
 		) {
 			Ok(()) => 0,
@@ -58,23 +58,26 @@ unsafe fn stub_fn_delegate(
 	vmctx: *mut VMContext,
 	externals: &[&dyn Function],
 	func_index: u32,
-	executor_state: &mut FunctionExecutorState,
+	executor_state: Option<&mut FunctionExecutorState>,
 	values_vec: *mut i64,
 ) -> Result<()>
 {
-	let func = externals.get(func_index)
+	let func = externals.get(func_index as usize)
 		.ok_or_else(|| format!("call to undefined external function with index {}", func_index))?;
+	let executor_state = executor_state
+		.ok_or_else(|| "executor state is None during call to external function")?;
 
 	let mut context = FunctionExecutor::new(vmctx, executor_state)?;
 
 	let signature = func.signature();
 	let mut args = signature.args.iter()
 		.enumerate()
-		.map(|(i, param)| read_value_from(values_vec.offset(i as isize - 1), param.value_type));
+		.map(|(i, &param_type)| read_value_from(values_vec.offset(i as isize - 1), param_type));
 
-	let return_val = func.execute(&mut context, &mut args)?;
+	let return_val = func.execute(&mut context, &mut args)
+		.map_err(Error::FunctionExecution)?;
 	if let Some(val) = return_val {
-		write_value_to(values_vec, return_val);
+		write_value_to(values_vec, val);
 	}
 	Ok(())
 }
@@ -237,10 +240,10 @@ impl binemit::RelocSink for RelocSink {
 
 unsafe fn write_value_to(p: *mut i64, val: Value) {
 	match val {
-		Value::I32(i) => ptr::write(p as *mut i32, *i),
-		Value::I64(i) => ptr::write(p as *mut i64, *i),
-		Value::F32(u) => ptr::write(p as *mut u32, *u),
-		Value::F64(u) => ptr::write(p as *mut u64, *u),
+		Value::I32(i) => ptr::write(p as *mut i32, i),
+		Value::I64(i) => ptr::write(p as *mut i64, i),
+		Value::F32(u) => ptr::write(p as *mut u32, u),
+		Value::F64(u) => ptr::write(p as *mut u64, u),
 	}
 }
 
