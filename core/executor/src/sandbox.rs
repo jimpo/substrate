@@ -582,4 +582,3 @@ impl<FR> Store<FR> {
 		instance_idx as u32
 	}
 }
-
