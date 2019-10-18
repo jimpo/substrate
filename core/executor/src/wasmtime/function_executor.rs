@@ -1,11 +1,11 @@
 use crate::allocator::FreeingBumpHeapAllocator;
 use crate::error::{Error, Result};
 use crate::sandbox::{self, SandboxCapabilities, SupervisorFuncIndex};
-use crate::wasmtime::util::{cranelift_ir_signature, cranelift_ir_type};
+use crate::wasmtime::util::cranelift_ir_signature;
 
 use codec::{Decode, Encode};
 use cranelift_codegen::ir;
-use cranelift_codegen::isa::{CallConv, TargetFrontendConfig};
+use cranelift_codegen::isa::TargetFrontendConfig;
 use log::trace;
 use primitives::sandbox as sandbox_primitives;
 use std::cmp;

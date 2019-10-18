@@ -6853,7 +6853,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 [[package]]
 name = "wasmtime-debug"
 version = "0.2.0"
-source = "git+https://github.com/jimpo/wasmtime.git#d3b9d1022ee108ed17db6a532603418875d7b421"
+source = "git+https://github.com/jimpo/wasmtime.git#bf82fcec2811bfcba39aa4c9acc965d24086e54f"
 dependencies = [
  "cranelift-codegen 0.44.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "cranelift-entity 0.44.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -6870,7 +6870,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-environ"
 version = "0.2.0"
-source = "git+https://github.com/jimpo/wasmtime.git#d3b9d1022ee108ed17db6a532603418875d7b421"
+source = "git+https://github.com/jimpo/wasmtime.git#bf82fcec2811bfcba39aa4c9acc965d24086e54f"
 dependencies = [
  "base64 0.10.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "bincode 1.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -6898,7 +6898,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-jit"
 version = "0.2.0"
-source = "git+https://github.com/jimpo/wasmtime.git#d3b9d1022ee108ed17db6a532603418875d7b421"
+source = "git+https://github.com/jimpo/wasmtime.git#bf82fcec2811bfcba39aa4c9acc965d24086e54f"
 dependencies = [
  "cranelift-codegen 0.44.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "cranelift-entity 0.44.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -6917,7 +6917,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-runtime"
 version = "0.2.0"
-source = "git+https://github.com/jimpo/wasmtime.git#d3b9d1022ee108ed17db6a532603418875d7b421"
+source = "git+https://github.com/jimpo/wasmtime.git#bf82fcec2811bfcba39aa4c9acc965d24086e54f"
 dependencies = [
  "cc 1.0.45 (registry+https://github.com/rust-lang/crates.io-index)",
  "cranelift-codegen 0.44.0 (registry+https://github.com/rust-lang/crates.io-index)",

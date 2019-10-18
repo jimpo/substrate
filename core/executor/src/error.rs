@@ -121,6 +121,10 @@ pub enum WasmError {
 	InvalidModule,
 	/// Wasm code could not be deserialized.
 	CantDeserializeWasm,
+	/// The module does not export a linear memory named `memory`.
+	InvalidMemory,
+	/// The number of heap pages requested is disallowed by the module.
+	InvalidHeapPages,
 	/// Instantiation error.
 	Instantiation(Error),
 	/// The compiler does not support the host machine as a target.

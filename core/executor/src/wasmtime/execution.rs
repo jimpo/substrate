@@ -22,9 +22,8 @@ use crate::wasmtime::trampoline::{TrampolineState, make_trampoline};
 use crate::wasmtime::util::cranelift_ir_signature;
 use crate::{Externalities, RuntimeVersion};
 
-use cranelift_codegen::ir::types;
+use codec::Decode;
 use cranelift_codegen::isa::TargetIsa;
-use cranelift_codegen::{ir, isa};
 use cranelift_entity::{EntityRef, PrimaryMap};
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_wasm::DefinedFuncIndex;
@@ -33,90 +32,42 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::mem;
 use std::rc::Rc;
-use wasm_interface::{HostFunctions, Pointer, Signature, ValueType, WordSize};
-use wasmtime_environ::{translate_signature, Module, WASM_PAGE_SIZE};
+use wasm_interface::{HostFunctions, Pointer, WordSize};
+use wasmtime_environ::{Module, translate_signature};
 use wasmtime_jit::{
 	ActionOutcome, ActionError, CodeMemory, CompilationStrategy, CompiledModule, Compiler, Context,
 	SetupError, RuntimeValue,
 };
 use wasmtime_runtime::{Export, Imports, InstanceHandle, VMFunctionBody};
 
-struct WasmtimeRuntime {
+pub struct WasmtimeRuntime {
 	module: CompiledModule,
 	context: Context,
-	min_heap_pages: u32,
+	max_heap_pages: Option<u32>,
 	heap_pages: u32,
 	version: Option<RuntimeVersion>,
 }
 
 impl WasmRuntime for WasmtimeRuntime {
 	fn update_heap_pages(&mut self, heap_pages: u64) -> bool {
-		let heap_pages = match u32::try_from(heap_pages) {
-			Ok(heap_pages) => heap_pages,
-			Err(_) => return false,
-		};
-		if heap_pages < self.min_heap_pages {
-			return false;
+		match heap_pages_valid(heap_pages, self.max_heap_pages) {
+			Some(heap_pages) => {
+				self.heap_pages = heap_pages;
+				true
+			}
+			None => false,
 		}
-		self.heap_pages = heap_pages;
-		true
 	}
 
 	fn call(&mut self, ext: &mut dyn Externalities, method: &str, data: &[u8]) -> Result<Vec<u8>> {
-		clear_globals(&mut *self.context.get_global_exports().borrow_mut());
-
-		let mut instance = self.module.instantiate()
-			.map_err(SetupError::Instantiate)
-			.map_err(ActionError::Setup)
-			.map_err(Error::Wasmtime)?;
-
-		let args = unsafe {
-			// TODO: Ideally there would be a way to set the heap pages during instantiation rather
-			// that growing the memory after the fact, as this way may require an additional mmap
-			// and copy. However, the wasmtime API doesn't support that at this time.
-			grow_memory(&mut instance, self.heap_pages)?;
-
-			// Initialize the function executor state.
-			let executor_state = FunctionExecutorState::new(
-				mem::transmute::<_, &'static mut Compiler>(self.context.compiler_mut()),
-				get_heap_base(&instance)?,
-			);
-			reset_host_state(&mut self.context, Some(executor_state))?;
-
-			// Write the input data into guest memory.
-			let (data_ptr, data_len) = inject_input_data(&mut self.context, &mut instance, data)?;
-			[RuntimeValue::I32(u32::from(data_ptr) as i32), RuntimeValue::I32(data_len as i32)]
-		};
-
-		// Invoke the function in the runtime.
-		let outcome = externalities::set_and_run_with_externalities(ext, || {
-			self.context
-				.invoke(&mut instance, method, &args[..])
-				.map_err(Error::Wasmtime)
-		})?;
-		let trap_error = reset_host_state(&mut self.context, None)?;
-		let (output_ptr, output_len) = match outcome {
-			ActionOutcome::Returned { values } => {
-				if values.len()	!= 1 {
-					return Err(Error::InvalidReturn);
-				}
-				if let RuntimeValue::I64(val) = values[0] {
-					let output_ptr = <Pointer<u8>>::new(val as u32);
-					let output_len = ((val as u64) >> 32) as usize;
-					(output_ptr, output_len)
-				} else {
-					return Err(Error::InvalidReturn);
-				}
-			}
-			ActionOutcome::Trapped { message } =>
-				return Err(trap_error.unwrap_or_else(|| Error::FunctionExecution(message))),
-		};
-
-		// Read the output data from guest memory.
-		let mut output = vec![0; output_len];
-		let memory = unsafe { get_memory_mut(&mut instance)? };
-		read_memory_into(memory, output_ptr, &mut output)?;
-		Ok(output)
+		call_method(
+			&mut self.context,
+			&mut self.module,
+			ext,
+			method,
+			data,
+			self.heap_pages,
+		)
 	}
 
 	fn version(&self) -> Option<RuntimeVersion> {
@@ -124,7 +75,50 @@ impl WasmRuntime for WasmtimeRuntime {
 	}
 }
 
-pub fn create_compiled_unit(code: &[u8])
+pub fn create_instance<E: Externalities>(ext: &mut E, code: &[u8], heap_pages: u64)
+	-> std::result::Result<WasmtimeRuntime, WasmError>
+{
+	let (mut compiled_module, mut context) = create_compiled_unit(code)?;
+
+	// Inspect the module for the min and max memory sizes.
+	let (min_memory_size, max_memory_size) = {
+		let module = compiled_module.module_ref();
+		let memory_index = match module.exports.get("memory") {
+			Some(wasmtime_environ::Export::Memory(memory_index)) => *memory_index,
+			_ => return Err(WasmError::InvalidMemory),
+		};
+		let memory_plan = module.memory_plans.get(memory_index)
+			.expect("memory_index is retrieved from the module's exports map; qed");
+		(memory_plan.memory.minimum, memory_plan.memory.maximum)
+	};
+
+	// Check that heap_pages is within the allowed range.
+	let max_heap_pages = max_memory_size.map(|max| max.saturating_sub(min_memory_size));
+	let heap_pages = heap_pages_valid(heap_pages, max_heap_pages)
+		.ok_or_else(|| WasmError::InvalidHeapPages)?;
+
+	// Call to determine runtime version.
+	let version_result = call_method(
+		&mut context,
+		&mut compiled_module,
+		ext,
+		"Core_version",
+		&[],
+		heap_pages
+	);
+	let version = version_result
+		.ok()
+		.and_then(|v| RuntimeVersion::decode(&mut v.as_slice()).ok());
+	Ok(WasmtimeRuntime {
+		module: compiled_module,
+		context,
+		max_heap_pages,
+		heap_pages,
+		version,
+	})
+}
+
+fn create_compiled_unit(code: &[u8])
 	-> std::result::Result<(CompiledModule, Context), WasmError>
 {
 	let isa = target_isa()?;
@@ -141,7 +135,72 @@ pub fn create_compiled_unit(code: &[u8])
 	// Compile the wasm module.
 	let module = context.compile_module(&code)
 		.map_err(WasmError::WasmtimeSetup)?;
+
 	Ok((module, context))
+}
+
+fn call_method(
+	context: &mut Context,
+	module: &mut CompiledModule,
+	ext: &mut dyn Externalities,
+	method: &str,
+	data: &[u8],
+	heap_pages: u32,
+) -> Result<Vec<u8>> {
+	clear_globals(&mut *context.get_global_exports().borrow_mut());
+
+	let mut instance = module.instantiate()
+		.map_err(SetupError::Instantiate)
+		.map_err(ActionError::Setup)
+		.map_err(Error::Wasmtime)?;
+
+	let args = unsafe {
+		// TODO: Ideally there would be a way to set the heap pages during instantiation rather
+		// that growing the memory after the fact, as this way may require an additional mmap
+		// and copy. However, the wasmtime API doesn't support that at this time.
+		grow_memory(&mut instance, heap_pages)?;
+
+		// Initialize the function executor state.
+		let executor_state = FunctionExecutorState::new(
+			mem::transmute::<_, &'static mut Compiler>(context.compiler_mut()),
+			get_heap_base(&instance)?,
+		);
+		reset_host_state(context, Some(executor_state))?;
+
+		// Write the input data into guest memory.
+		let (data_ptr, data_len) = inject_input_data(context, &mut instance, data)?;
+		[RuntimeValue::I32(u32::from(data_ptr) as i32), RuntimeValue::I32(data_len as i32)]
+	};
+
+	// Invoke the function in the runtime.
+	let outcome = externalities::set_and_run_with_externalities(ext, || {
+		context
+			.invoke(&mut instance, method, &args[..])
+			.map_err(Error::Wasmtime)
+	})?;
+	let trap_error = reset_host_state(context, None)?;
+	let (output_ptr, output_len) = match outcome {
+		ActionOutcome::Returned { values } => {
+			if values.len()	!= 1 {
+				return Err(Error::InvalidReturn);
+			}
+			if let RuntimeValue::I64(val) = values[0] {
+				let output_ptr = <Pointer<u8>>::new(val as u32);
+				let output_len = ((val as u64) >> 32) as usize;
+				(output_ptr, output_len)
+			} else {
+				return Err(Error::InvalidReturn);
+			}
+		}
+		ActionOutcome::Trapped { message } =>
+			return Err(trap_error.unwrap_or_else(|| Error::FunctionExecution(message))),
+	};
+
+	// Read the output data from guest memory.
+	let mut output = vec![0; output_len];
+	let memory = unsafe { get_memory_mut(&mut instance)? };
+	read_memory_into(memory, output_ptr, &mut output)?;
+	Ok(output)
 }
 
 /// The implementation is based on wasmtime_wasi::instantiate_wasi.
@@ -215,22 +274,14 @@ fn clear_globals(global_exports: &mut HashMap<String, Option<Export>>) {
 }
 
 unsafe fn grow_memory(instance: &mut InstanceHandle, pages: u32) -> Result<()> {
-	let (memory_index, current_pages) = match instance.lookup_immutable("memory") {
-		Some(Export::Memory { definition, vmctx: _, memory }) => {
-			let definition = &*definition;
-			assert_eq!(
-				memory.memory.minimum.checked_mul(WASM_PAGE_SIZE),
-				Some(definition.current_length as u32)
-			);
-			let index = instance.memory_index(definition);
-			(index, memory.memory.minimum)
-		}
+	let memory_index = match instance.lookup_immutable("memory") {
+		Some(Export::Memory { definition, vmctx: _, memory: _ }) =>
+			instance.memory_index(&*definition),
 		_ => return Err(Error::InvalidMemoryReference),
 	};
-	if current_pages < pages {
-		instance.memory_grow(memory_index, pages - current_pages);
-	}
-	Ok(())
+	instance.memory_grow(memory_index, pages)
+		.map(|_| ())
+		.ok_or_else(|| "requested heap_pages would exceed maximum memory size".into())
 }
 
 fn get_host_state(context: &mut Context) -> Result<&mut TrampolineState> {
@@ -285,4 +336,16 @@ unsafe fn get_memory_mut(instance: &mut InstanceHandle) -> Result<&mut [u8]> {
 			)),
 		_ => Err(Error::InvalidMemoryReference),
 	}
+}
+
+fn heap_pages_valid(heap_pages: u64, max_heap_pages: Option<u32>)
+	-> Option<u32>
+{
+	let heap_pages = u32::try_from(heap_pages).ok()?;
+	if let Some(max_heap_pages) = max_heap_pages {
+		if heap_pages > max_heap_pages {
+			return None;
+		}
+	}
+	Some(heap_pages)
 }
