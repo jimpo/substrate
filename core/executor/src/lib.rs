@@ -40,6 +40,8 @@ mod host_interface;
 mod wasm_runtime;
 #[cfg(feature = "wasmtime")]
 mod wasmtime;
+#[cfg(test)]
+mod tests;
 
 pub mod error;
 pub use wasmi;
