@@ -50,7 +50,7 @@ fn sign(xt: CheckedExtrinsic) -> UncheckedExtrinsic {
 fn new_test_ext(code: &[u8]) -> TestExternalities<Blake2Hasher> {
 	TestExternalities::new_with_code(
 		code,
-		node_testing::genesis::config(false, Some(code)).clone().build_storage().unwrap(),
+		node_testing::genesis::config(false, Some(code)).build_storage().unwrap(),
 	)
 }
 
@@ -62,6 +62,8 @@ fn construct_block(
 	extrinsics: Vec<CheckedExtrinsic>,
 ) -> (Vec<u8>, Hash) {
 	use trie::{TrieConfiguration, trie_types::Layout};
+
+	let mut ext = env.ext();
 
 	// sign extrinsics.
 	let extrinsics = extrinsics.into_iter().map(sign).collect::<Vec<_>>();
@@ -82,7 +84,7 @@ fn construct_block(
 
 	// execute the block to get the real header.
 	executor.call::<_, NeverNativeValue, fn() -> _>(
-		env,
+		&mut ext,
 		"Core_initialize_block",
 		&header.encode(),
 		true,
@@ -91,7 +93,7 @@ fn construct_block(
 
 	for i in extrinsics.iter() {
 		executor.call::<_, NeverNativeValue, fn() -> _>(
-			env,
+			&mut ext,
 			"BlockBuilder_apply_extrinsic",
 			&i.encode(),
 			true,
@@ -100,7 +102,7 @@ fn construct_block(
 	}
 
 	let header = match executor.call::<_, NeverNativeValue, fn() -> _>(
-		env,
+		&mut ext,
 		"BlockBuilder_finalize_block",
 		&[0u8;0],
 		true,
@@ -120,12 +122,18 @@ fn construct_block(
 fn blocks(executor: &NativeExecutor<Executor>) -> ((Vec<u8>, Hash), (Vec<u8>, Hash)) {
 	let mut t = new_test_ext(COMPACT_CODE);
 
-	let block1_extrinsics = vec![
+	let mut block1_extrinsics = vec![
 		CheckedExtrinsic {
 			signed: None,
 			function: Call::Timestamp(timestamp::Call::set(42 * 1000)),
 		},
 	];
+	block1_extrinsics.extend((0..20).map(|i| {
+		CheckedExtrinsic {
+			signed: Some((alice(), signed_extra(i, 0))),
+			function: Call::Balances(balances::Call::transfer(bob().into(), 1 * DOLLARS)),
+		}
+	}));
 	let block1 = construct_block(
 		executor,
 		&mut t,
@@ -134,18 +142,12 @@ fn blocks(executor: &NativeExecutor<Executor>) -> ((Vec<u8>, Hash), (Vec<u8>, Ha
 		block1_extrinsics,
 	);
 
-	let mut block2_extrinsics = vec![
+	let block2_extrinsics = vec![
 		CheckedExtrinsic {
 			signed: None,
 			function: Call::Timestamp(timestamp::Call::set(52 * 1000)),
 		},
 	];
-	block2_extrinsics.extend((0..20).map(|i| {
-		CheckedExtrinsic {
-			signed: Some((alice(), signed_extra(i, 0))),
-			function: Call::Balances(balances::Call::transfer(bob().into(), 1 * DOLLARS)),
-		}
-	}));
 	let block2 = construct_block(
 		executor,
 		&mut t,
@@ -179,29 +181,21 @@ fn bench_execute_block(c: &mut Criterion) {
 
 			let (block1, block2) = blocks(&executor);
 
-			// Just execute something to compile the Wasm before benchmarking if using the compiled
-			// strategy.
-			executor.runtime_version(&mut new_test_ext(COMPACT_CODE));
+			// Just execute something to initialize the runtime cache.
+			{
+				let mut ext = new_test_ext(COMPACT_CODE);
+				executor.runtime_version(&mut ext.ext());
+			}
 
 			b.iter_batched_ref(
-				|| {
-					let mut ext = new_test_ext(COMPACT_CODE);
+				|| new_test_ext(COMPACT_CODE),
+				|ext| {
 					// Benchmark the first block.
+					let mut ext = ext.ext();
 					executor.call::<_, NeverNativeValue, fn() -> _>(
 						&mut ext,
 						"Core_execute_block",
 						&block1.0,
-						use_native,
-						None,
-					).0.unwrap();
-					ext
-				},
-				|ext| {
-					// Benchmark the first block.
-					executor.call::<_, NeverNativeValue, fn() -> _>(
-						ext,
-						"Core_execute_block",
-						&block2.0,
 						use_native,
 						None,
 					).0.unwrap();

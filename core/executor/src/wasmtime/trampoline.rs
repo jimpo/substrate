@@ -72,10 +72,12 @@ unsafe fn stub_fn_delegate(
 	let signature = func.signature();
 	let mut args = signature.args.iter()
 		.enumerate()
-		.map(|(i, &param_type)| read_value_from(values_vec.offset(i as isize - 1), param_type));
+		.map(|(i, &param_type)| read_value_from(values_vec.offset(i as isize), param_type));
 
 	let return_val = func.execute(&mut context, &mut args)
-		.map_err(Error::FunctionExecution)?;
+		.map_err(|e| Error::FunctionExecution(
+			format!("error in external function {}: {}", func.name(), e)
+		))?;
 	if let Some(val) = return_val {
 		write_value_to(values_vec, val);
 	}
