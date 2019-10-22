@@ -107,8 +107,10 @@ fn impl_build_storage(
 		quote!( #inherent_instance: #bound )
 	});
 
+	let build_storage_ref_lifetime = syn::Lifetime::new("'a", Span::call_site());
+	let build_storage_ref_lifetime_def = syn::LifetimeDef::new(build_storage_ref_lifetime.clone());
 	let build_storage_impl = quote!(
-		<#runtime_generic: #runtime_trait, #inherent_instance_bound>
+		<#build_storage_ref_lifetime_def, #runtime_generic: #runtime_trait, #inherent_instance_bound>
 	);
 
 	let genesis_struct = &genesis_config.genesis_struct;
@@ -138,7 +140,7 @@ fn impl_build_storage(
 	quote!{
 		#[cfg(feature = "std")]
 		impl#genesis_impl GenesisConfig#genesis_struct #genesis_where_clause {
-			pub fn build_storage #fn_generic (self) -> std::result::Result<
+			pub fn build_storage #fn_generic (&self) -> std::result::Result<
 				(
 					#scrate::sr_primitives::StorageOverlay,
 					#scrate::sr_primitives::ChildrenStorageOverlay,
@@ -152,7 +154,7 @@ fn impl_build_storage(
 
 			/// Assimilate the storage for this module into pre-existing overlays.
 			pub fn assimilate_storage #fn_generic (
-				self,
+				&self,
 				tuple_storage: &mut (
 					#scrate::sr_primitives::StorageOverlay,
 					#scrate::sr_primitives::ChildrenStorageOverlay,
@@ -166,7 +168,8 @@ fn impl_build_storage(
 		}
 
 		#[cfg(feature = "std")]
-		impl#build_storage_impl #build_storage_impl_trait for GenesisConfig#genesis_struct
+		impl#build_storage_impl #build_storage_impl_trait
+		 	for &#build_storage_ref_lifetime GenesisConfig#genesis_struct
 			#where_clause
 		{
 			fn build_module_genesis_storage(

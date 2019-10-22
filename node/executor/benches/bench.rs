@@ -18,7 +18,9 @@ use codec::{Decode, Encode};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use node_executor::Executor;
 use node_primitives::{BlockNumber, Hash};
-use node_runtime::{Block, BuildStorage, Call, CheckedExtrinsic, Header, UncheckedExtrinsic};
+use node_runtime::{
+	Block, BuildStorage, Call, CheckedExtrinsic, GenesisConfig, Header, UncheckedExtrinsic,
+};
 use node_runtime::constants::currency::*;
 use node_testing::keyring::*;
 use primitives::{Blake2Hasher, NativeOrEncoded, NeverNativeValue};
@@ -52,8 +54,11 @@ fn sign(xt: CheckedExtrinsic) -> UncheckedExtrinsic {
 	node_testing::keyring::sign(xt, VERSION, GENESIS_HASH)
 }
 
-fn new_test_ext() -> TestExternalities<Blake2Hasher> {
-	let genesis_config = node_testing::genesis::config(false, Some(COMPACT_CODE));
+fn genesis_config() -> GenesisConfig {
+	node_testing::genesis::config(false, Some(COMPACT_CODE))
+}
+
+fn new_test_ext(genesis_config: &GenesisConfig) -> TestExternalities<Blake2Hasher> {
 	let mut test_ext = TestExternalities::new_with_code(
 		COMPACT_CODE,
 		genesis_config.build_storage().unwrap(),
@@ -123,8 +128,10 @@ fn construct_block<E: Externalities>(
 }
 
 
-fn test_blocks(executor: &NativeExecutor<Executor>) -> Vec<(Vec<u8>, Hash)> {
-	let mut test_ext = new_test_ext();
+fn test_blocks(genesis_config: &GenesisConfig, executor: &NativeExecutor<Executor>)
+	-> Vec<(Vec<u8>, Hash)>
+{
+	let mut test_ext = new_test_ext(genesis_config);
 	let mut block1_extrinsics = vec![
 		CheckedExtrinsic {
 			signed: None,
@@ -152,6 +159,8 @@ fn bench_execute_block(c: &mut Criterion) {
 	c.bench_function_over_inputs(
 		"execute blocks",
 		|b, strategy| {
+			let genesis_config = genesis_config();
+
 			let (use_native, wasm_method) = match strategy {
 				ExecutionMethod::Native => (true, WasmExecutionMethod::Interpreted),
 				ExecutionMethod::Wasm(wasm_method) => (false, *wasm_method),
@@ -160,14 +169,14 @@ fn bench_execute_block(c: &mut Criterion) {
 
 			// Get the runtime version to initialize the runtimes cache.
 			{
-				let mut test_ext = new_test_ext();
+				let mut test_ext = new_test_ext(&genesis_config);
 				executor.runtime_version(&mut test_ext.ext());
 			}
 
-			let blocks = test_blocks(&executor);
+			let blocks = test_blocks(&genesis_config, &executor);
 
 			b.iter_batched_ref(
-				|| new_test_ext(),
+				|| new_test_ext(&genesis_config),
 				|test_ext| {
 					for block in blocks.iter() {
 						executor.call::<_, NeverNativeValue, fn() -> _>(

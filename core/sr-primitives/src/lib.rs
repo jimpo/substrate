@@ -480,13 +480,13 @@ macro_rules! impl_outer_config {
 				)*
 			}
 			#[cfg(any(feature = "std", test))]
-			impl $crate::BuildStorage for $main {
+			impl<'a> $crate::BuildStorage for &'a $main {
 				fn assimilate_storage(
 					self,
 					storage: &mut ($crate::StorageOverlay, $crate::ChildrenStorageOverlay),
 				) -> std::result::Result<(), String> {
 					$(
-						if let Some(extra) = self.[< $snake $(_ $instance )? >] {
+						if let Some(ref extra) = self.[< $snake $(_ $instance )? >] {
 							$crate::impl_outer_config! {
 								@CALL_FN
 								$concrete;
