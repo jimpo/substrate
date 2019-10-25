@@ -50,6 +50,8 @@ arg_enum! {
 	pub enum WasmExecutionMethod {
 		// Uses an interpreter.
 		Interpreted,
+		// Uses a compiled runtime.
+		Compiled,
 	}
 }
 
@@ -57,6 +59,8 @@ impl Into<service::config::WasmExecutionMethod> for WasmExecutionMethod {
 	fn into(self) -> service::config::WasmExecutionMethod {
 		match self {
 			WasmExecutionMethod::Interpreted => service::config::WasmExecutionMethod::Interpreted,
+			#[cfg(feature = "wasmtime")]
+			WasmExecutionMethod::Compiled => service::config::WasmExecutionMethod::Compiled,
 		}
 	}
 }
